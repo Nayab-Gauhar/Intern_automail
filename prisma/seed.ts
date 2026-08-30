@@ -2403,6 +2403,9 @@ async function seedOutreachHistory() {
       workspaceId: WS,
       emailAccountId: MAILBOX,
       localDate: new Date(key),
+      // reservedCount must be >= sentCount (CHECK constraint). Historical days are
+      // fully settled, so every send has an implied reservation.
+      reservedCount: c.sent,
       sentCount: c.sent,
       warmupCount: 0,
       failedCount: 0,
