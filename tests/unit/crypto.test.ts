@@ -20,7 +20,8 @@ let generateToken: (n?: number) => string
 let safeEqual: (a: string, b: string) => boolean
 
 beforeAll(async () => {
-  process.env.NODE_ENV = 'test'
+  // NODE_ENV is typed readonly, so assign through the record index.
+  ;(process.env as Record<string, string | undefined>).NODE_ENV = 'test'
   process.env.DATABASE_URL = 'postgresql://u:p@127.0.0.1:5433/db?schema=public'
   process.env.APP_URL = 'http://localhost:3000'
   process.env.AUTH_SECRET = 'x'.repeat(32)
