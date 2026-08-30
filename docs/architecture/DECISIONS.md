@@ -169,3 +169,45 @@ wrong** — it still exists in zod 4.5.4 (`typeof z.nativeEnum === 'function'`) 
 is deprecated in favour of `z.enum`, which is a style preference, not a runtime failure.
 Recorded because a fabricated breakage is as costly to chase as a real one, and prefer
 `z.enum` in new code regardless.
+
+---
+
+## D6 — `lib/rate-limit.ts` may touch the Prisma client; the lint rule now says so explicitly
+
+**Status:** decided and enforced.
+
+The auth agent flagged that `src/lib/rate-limit.ts` imports the db client, and that eslint
+permitted it — not because the rule granted an exception, but because the rule matched only
+the `@/lib/db` **alias** while the file used a relative `./db`. Verified:
+
+```
+import { db } from '@/lib/db'        -> blocked
+import { db } from '../../lib/db'    -> ALLOWED   ← the hole
+```
+
+Two separate things to fix, and they pull in opposite directions.
+
+### The rule had a hole, and that is the real defect
+
+A restriction that a different spelling of the same import silently defeats is not a
+restriction. `no-restricted-imports` now uses `patterns` (`['@/lib/db', '**/lib/db']`)
+alongside `paths`, so both spellings are blocked. Re-verified both directions after the
+change. The agent surfacing this instead of quietly relying on it is why it got fixed.
+
+### The limiter genuinely belongs in `lib/`, so it is a declared exception
+
+The limiter cannot live behind a module's `Ctx`: its key is an IP address or an email seen
+**before any workspace exists** — registration, login, password reset. A `modules/ratelimit/`
+folder would satisfy the letter of the rule while adding a module whose entire purpose is to
+be callable without tenancy, which is the one thing every other module must never be.
+
+So `src/lib/rate-limit.ts` joins `src/lib/db.ts` and `src/modules/*/repo.ts` on the ignore
+list. It is now an *explicit, reviewable* exception rather than an accident of path spelling.
+The rule's intent — no database access from pages, components, route handlers, or services —
+is unchanged and now harder to bypass than before.
+
+### Consequence
+
+Any future file needing the client must either be a `repo.ts` or be added to that ignore list
+in a commit that says why. Three entries is a reviewable list; a rule with a silent bypass is
+not.

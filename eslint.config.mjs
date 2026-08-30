@@ -41,7 +41,7 @@ export default tseslint.config(
   // lib/db, and prisma/. A Prisma call in a page or route handler is a bug.
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/modules/**/repo.ts', 'src/lib/db.ts'],
+    ignores: ['src/modules/**/repo.ts', 'src/lib/db.ts', 'src/lib/rate-limit.ts'],
     rules: {
       // The base rule cannot distinguish a type-only import, so use the
       // typescript-eslint variant with allowTypeImports. The intent is to block
@@ -56,13 +56,18 @@ export default tseslint.config(
               name: '@prisma/client',
               allowTypeImports: true,
               message:
-                'Prisma may only be imported from src/modules/*/repo.ts or src/lib/db.ts. Go through the module public API. (Type-only imports are allowed.)',
+                'Prisma may only be imported from src/modules/*/repo.ts, src/lib/db.ts, or src/lib/rate-limit.ts. Go through the module public API. (Type-only imports are allowed.)',
             },
+          ],
+          // Patterns, not just the alias: a relative '../../lib/db' bypassed the
+          // path-based rule entirely, which is how the limiter reached the client
+          // without a suppression. Both spellings are now covered.
+          patterns: [
             {
-              name: '@/lib/db',
+              group: ['@/lib/db', '**/lib/db'],
               allowTypeImports: true,
               message:
-                'Import the db client only in a repo.ts. Callers use the module public API (index.ts).',
+                'Import the db client only in a repo.ts (or lib/rate-limit.ts). Callers use the module public API (index.ts). Relative paths are covered too.',
             },
           ],
         },
