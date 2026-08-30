@@ -9,16 +9,22 @@
 > route-handler-vs-action rules, transactions, the Prisma 7 client, pagination,
 > caching, idempotency, observability, and rate limiting.
 >
-> **Out of scope.** The schema (`01-database.md`), the queue and sending engine
-> internals (`06`), the route tree and components (`03`), analytics/CRM/AI
-> internals (`08`), deploy topology (`09`). Where this document names a table or
-> column it has been grepped against `prisma/schema.prisma`; where it names a
-> function in another doc's module, that doc is authoritative on the body.
+> **Out of scope, and who owns it instead.** The schema (`01-database.md`); the
+> queue, sending engine, and their event names (`06`); sessions, `Ctx` derivation,
+> the capability matrix, validation, rate limiting, CSRF (`07`); the route tree and
+> components (`03`); analytics/CRM/AI internals (`08`); deploy topology, the logger,
+> and the observability taxonomy (`09`). Where those docs own a mechanism, this one
+> **references and defers** rather than restating — §4, §5, §6, §11 and §14 each open
+> with an ownership note naming what is theirs and what is this document's, and §13
+> attributes the logger and event names inline.
 >
-> **Verified.** Every TypeScript block in §4, §5, §6, §7 and §10 was compiled
-> against the pinned toolchain (`tsc --noEmit`, TypeScript 6.0.3, Prisma client
-> 7.10.0 generated from the live schema, zod 4.5.4) before being pasted here.
-> They are not illustrative sketches; they typecheck.
+> **Verified against the live tree.** `src/lib/{db,errors,result,logger,env}.ts` and
+> `src/server/authz.ts` are already on disk; the code shown in §6 and §9 is what is
+> implemented, not a proposal. The five-file `leads` module in §3.3 was extracted to
+> `src/modules/leads/`, compiled clean with `tsc --noEmit` against those files and a
+> Prisma client generated from the live schema (TypeScript 6.0.3, Prisma 7.10.0,
+> zod 4.5.4), then removed. Every model, field, and enum value cited was grepped
+> against `prisma/schema.prisma`.
 
 ---
 
@@ -26,17 +32,20 @@
 
 Restated because every section is an application of one of them.
 
-1. **`workspaceId` comes from the session, never from the caller.** A
-   `workspaceId` in a form field, JSON body, or search param is ignored and
-   logged as `authz.cross_workspace_attempt`.
+1. **`workspaceId` comes from the session, never from the caller.** Every action
+   schema is `.strict()`, so a `workspaceId` in a form field, JSON body, or search
+   param is a *validation failure* and is logged as
+   `authz.cross_workspace_attempt` (`07` §9.2).
 2. **Every service entrypoint takes `Ctx` as its first parameter.** No
    exceptions, including read-only functions and job handlers.
 3. **Prisma is importable only from `src/modules/*/repo.ts`, `src/lib/db.ts`,
    and `prisma/`.** Enforced by `no-restricted-imports` in `eslint.config.mjs`.
 4. **Cross-workspace access returns 404, never 403.** 403 confirms the resource
    exists in someone else's workspace.
-5. **Modules never import `src/server/**`.** Guards and the action wrapper sit
-   *above* modules. This one rule is what keeps the graph acyclic (§2.4).
+5. **Modules never import `src/server/**`, except `server/authz.ts`.** Guards and
+   the action wrapper sit *above* modules; the capability matrix is the one thing a
+   service must reach upward for, and it touches no data (§4.2). This rule is what
+   keeps the graph acyclic (§2.4).
 6. **Expected failures return `Result<T, E>`; unexpected failures throw
    `AppError`.** Never a bare `null` for a failure, never a thrown string.
 7. **No network I/O inside a database transaction.** Not Gmail, not Anthropic,
@@ -60,19 +69,25 @@ Restated because every section is an application of one of them.
 │  src/app/**            pages, layouts, route handlers, action files     │  ← may import
 │  src/components/**     presentation                                     │     server/ + modules/*/index
 ├─────────────────────────────────────────────────────────────────────────┤
-│  src/server/**         SERVER-ONLY EDGE                                 │  ← may import
+│  src/server/**         SERVER-ONLY EDGE   (file list owned by 07 §2)    │  ← may import
 │    session.ts          cookie ⇄ Session row, sliding refresh            │     modules/*/index + lib
-│    guards.ts           requireAuth · requireWorkspace · requireRole     │
+│    ctx.ts              Ctx type · requireWorkspace · workspace switch   │
+│    authz.ts            Capability · MATRIX · can() · requireCan()       │
 │    action.ts           the one Server Action wrapper                    │
+│    route.ts            the route-handler wrapper (§7.3)                 │
+│    origin.ts           assertSameOrigin() for route handlers            │
+│    audit.ts            writeAudit()                                     │
 │    request-context.ts  AsyncLocalStorage { requestId, workspaceId }     │
-│    origin.ts           same-origin / CSRF check for route handlers      │
+│    system-ctx.ts       Ctx from Job.workspaceId, for the worker (§4.4)  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  src/modules/<domain>/ DOMAIN LOGIC — index · service · repo ·          │  ← may import
 │                        schema · types (+ pure helpers)                  │     other modules'
 │                                                                          │     index.ts + lib
 ├─────────────────────────────────────────────────────────────────────────┤
 │  src/lib/**            env · db · errors · result · logger · crypto ·   │  ← imports nothing
-│                        time · cursor · rate-limit · ids                 │     of ours
+│                        tokens · password · rate-limit · time · cn       │     of ours
+│                        (on disk today: db, env, errors, result,         │
+│                         logger, crypto, tokens, cn)                     │
 └─────────────────────────────────────────────────────────────────────────┘
 
 worker/                  index · loop · maintenance · registry
@@ -82,13 +97,15 @@ worker/                  index · loop · maintenance · registry
 
 `src/lib/**` is a leaf by construction: no file in it imports from `modules/`,
 `server/`, or `app/`. `src/lib/db.ts` is the only member that opens a socket.
+`src/server/authz.ts` is the one file in the edge layer that modules may import
+(§4.2) — it reads no table, so for graph purposes it sits with `lib/`.
 
 ### 1.1 Why `server/` is above `modules/` and not beside it
 
-`requireWorkspace()` must read a `WorkspaceMember` row, which is
-`workspace`'s table. So `server/guards.ts` → `modules/workspace`. If any module
-were allowed to import `server/guards.ts` to "get the current workspace", we
-would have `workspace → guards → workspace`. Instead:
+`requireWorkspace()` must read a `WorkspaceMember` row, which is `workspace`'s
+table. So `server/ctx.ts` → `modules/workspace`. If any module were allowed to
+import `server/ctx.ts` to "get the current workspace", we would have
+`workspace → ctx → workspace`. Instead:
 
 > **A module never discovers its own tenancy. It is told, via `Ctx`.**
 
@@ -269,7 +286,7 @@ driven from `campaigns`/`replies` calling into `leads`, never the reverse.
 ### 2.5 Two additions to the brief's module list
 
 The brief §3 lists fifteen module folders. Two things referenced by `03-frontend.md`
-have no home in that list. Both are resolved here and flagged in §17.
+have no home in that list. Both are resolved here and flagged in §17.10.
 
 - **`suppressions.*`** (`03` §2 references `suppressions.describeToken`) is
   **not** a module. `Suppression` is a leads-domain table; the code lives in
@@ -303,8 +320,8 @@ src/modules/<domain>/
 | File | May import | Must NOT contain | Must NOT import |
 |---|---|---|---|
 | `index.ts` | `./service`, `./schema`, `./types` | logic, Prisma, `server-only` | `./repo`, `@/server/*` |
-| `service.ts` | `./repo`, `./schema`, `./types`, `@/lib/*`, other modules' `index.ts` | raw SQL, Prisma model calls | `@prisma/client` for **queries** (types are fine), `@/server/*`, `next/*` |
-| `repo.ts` | `@/lib/db`, `@prisma/client`, `./types`, `@/server/ctx` types | business rules, error messages for users, cross-domain reads | other modules, `@/server/guards`, `next/*` |
+| `service.ts` | `./repo`, `./schema`, `./types`, `@/lib/*`, `@/server/authz`, other modules' `index.ts` | raw SQL, Prisma model calls | `@prisma/client` for **queries** (types are fine), any other `@/server/*`, `next/*` |
+| `repo.ts` | `@/lib/db`, `@prisma/client`, `./types`, the `Ctx` **type** | business rules, user-facing error messages, cross-domain reads | other modules, `@/server/authz`, `next/*` |
 | `schema.ts` | `zod`, `@prisma/client` (enums only), `./types` | any I/O, any DB access | `@/lib/db`, `./repo` |
 | `types.ts` | `@prisma/client` (enums only) | functions with side effects | everything else of ours |
 
@@ -495,20 +512,20 @@ export type UpdateLeadInput = z.output<typeof updateLeadSchema>
 #### 3.3.3 `repo.ts`
 
 Every function takes `Ctx` and every `where` starts with `workspaceId`. The
-optional `db: Db = prisma` parameter is how a service enlists the repo in an
+optional `database: Db = db` parameter is how a service enlists the repo in an
 interactive transaction without the repo knowing about transactions.
 
 ```ts
 // src/modules/leads/repo.ts
 import 'server-only'
 import { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/db'
+import { db } from '@/lib/db'
 import type { Ctx } from '@/server/ctx'
 import type { LeadFilter } from './schema'
 import type { LeadSummary } from './types'
 
-type Tx = Prisma.TransactionClient
-type Db = typeof prisma | Tx
+/** `Db` lets every function run standalone or enlisted in a caller's transaction. */
+type Db = typeof db | Prisma.TransactionClient
 
 const SUMMARY_SELECT = {
   id: true, email: true, fullName: true, firstName: true, lastName: true,
@@ -553,7 +570,7 @@ export async function findPage(
   ctx: Ctx,
   f: LeadFilter,
   decoded: { sortValue: string | number | Date | null; id: string } | null,
-  db: Db = prisma,
+  database: Db = db,
 ): Promise<LeadSummary[]> {
   const cmp = f.dir === 'desc' ? 'lt' : 'gt'
   const keyed: Prisma.LeadWhereInput[] = decoded
@@ -567,7 +584,7 @@ export async function findPage(
         ],
       }]
     : []
-  return db.lead.findMany({
+  return database.lead.findMany({
     where: { AND: [scope(ctx, f), ...keyed] },
     select: SUMMARY_SELECT,
     orderBy: [{ [f.sort]: f.dir }, { id: f.dir }],
@@ -575,8 +592,8 @@ export async function findPage(
   })
 }
 
-export async function findByIdInWorkspace(ctx: Ctx, leadId: string, db: Db = prisma) {
-  return db.lead.findFirst({
+export async function findByIdInWorkspace(ctx: Ctx, leadId: string, database: Db = db) {
+  return database.lead.findFirst({
     where: { id: leadId, workspaceId: ctx.workspaceId, deletedAt: null },
     include: {
       tagLinks:        { select: { leadTag:  { select: { id: true, name: true, colorToken: true } } } },
@@ -585,21 +602,21 @@ export async function findByIdInWorkspace(ctx: Ctx, leadId: string, db: Db = pri
   })
 }
 
-export async function insert(ctx: Ctx, data: Prisma.LeadCreateInput, db: Db = prisma) {
-  return db.lead.create({ data, select: SUMMARY_SELECT })
+export async function insert(ctx: Ctx, data: Prisma.LeadCreateInput, database: Db = db) {
+  return database.lead.create({ data, select: SUMMARY_SELECT })
 }
 
 /** Soft delete only. Leads are referenced by EmailEvent, threads, opportunities. */
-export async function softDeleteMany(ctx: Ctx, ids: string[], db: Db = prisma): Promise<number> {
-  const res = await db.lead.updateMany({
+export async function softDeleteMany(ctx: Ctx, ids: string[], database: Db = db): Promise<number> {
+  const res = await database.lead.updateMany({
     where: { id: { in: ids }, workspaceId: ctx.workspaceId, deletedAt: null },
     data: { deletedAt: new Date() },
   })
   return res.count
 }
 
-export async function countScoped(ctx: Ctx, f: LeadFilter, db: Db = prisma): Promise<number> {
-  return db.lead.count({ where: scope(ctx, f) })
+export async function countScoped(ctx: Ctx, f: LeadFilter, database: Db = db): Promise<number> {
+  return database.lead.count({ where: scope(ctx, f) })
 }
 ```
 
@@ -614,8 +631,10 @@ writes degrade to a 404 rather than silently succeeding (§6.4).
 // src/modules/leads/service.ts
 import 'server-only'
 import { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/db'
-import { ConflictError, NotFoundError, Ok, Err, type Result } from '@/lib/errors'
+import { db } from '@/lib/db'
+import { ConflictError, NotFoundError } from '@/lib/errors'
+import { ok, err, type Result } from '@/lib/result'
+import { requireCan } from '@/server/authz'
 import type { Ctx } from '@/server/ctx'
 import * as repo from './repo'
 import type { CreateLeadInput, LeadFilter, UpdateLeadInput } from './schema'
@@ -648,6 +667,7 @@ function decodeCursor(c: string | undefined, sort: LeadFilter['sort']) {
 }
 
 export async function list(ctx: Ctx, filter: LeadFilter): Promise<Page<LeadSummary>> {
+  requireCan(ctx, 'leads.view')
   const rows = await repo.findPage(ctx, filter, decodeCursor(filter.cursor, filter.sort))
   const hasMore = rows.length > filter.limit
   const page = hasMore ? rows.slice(0, filter.limit) : rows
@@ -657,8 +677,9 @@ export async function list(ctx: Ctx, filter: LeadFilter): Promise<Page<LeadSumma
 
 /** Throws NotFoundError for a missing lead AND for another workspace's lead. */
 export async function get(ctx: Ctx, leadId: string): Promise<LeadDetail> {
+  requireCan(ctx, 'leads.view')
   const row = await repo.findByIdInWorkspace(ctx, leadId)
-  if (!row) throw new NotFoundError('Lead', leadId)
+  if (!row) throw new NotFoundError('Lead')
   return {
     ...row,
     customFields: (row.customFields ?? {}) as Record<string, unknown>,
@@ -676,6 +697,7 @@ export async function create(
   ctx: Ctx,
   input: CreateLeadInput,
 ): Promise<Result<LeadSummary, LeadWriteError>> {
+  requireCan(ctx, 'leads.create')
   const data: Prisma.LeadCreateInput = {
     workspace:    { connect: { id: ctx.workspaceId } },
     email:        input.email,
@@ -690,7 +712,7 @@ export async function create(
     ...(input.ownerUserId ? { owner: { connect: { id: input.ownerUserId } } } : {}),
   }
   try {
-    return Ok(await prisma.$transaction(async (tx) => {
+    return ok(await db.$transaction(async (tx) => {
       const lead = await repo.insert(ctx, data, tx)
       if (input.tagIds.length) {
         await tx.leadTagLink.createMany({
@@ -704,40 +726,51 @@ export async function create(
     }, { isolationLevel: 'ReadCommitted', timeout: 10_000 }))
   } catch (e) {
     if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === UNIQUE_VIOLATION) {
-      const existing = await prisma.lead.findFirst({
+      const existing = await db.lead.findFirst({
         where: { workspaceId: ctx.workspaceId, email: input.email },
         select: { id: true },
       })
-      return Err({ kind: 'duplicate_email', existingLeadId: existing?.id ?? '' })
+      return err({ kind: 'duplicate_email', existingLeadId: existing?.id ?? '' })
     }
     throw e
   }
 }
 
 export async function update(ctx: Ctx, input: UpdateLeadInput): Promise<LeadSummary> {
-  const res = await prisma.lead.updateMany({
+  requireCan(ctx, 'leads.edit')
+  const res = await db.lead.updateMany({
     where: { id: input.leadId, workspaceId: ctx.workspaceId, deletedAt: null },
     data: {
       ...(input.firstName !== undefined ? { firstName: input.firstName } : {}),
       ...(input.status    !== undefined ? { status:    input.status    } : {}),
     },
   })
-  if (res.count === 0) throw new NotFoundError('Lead', input.leadId)
+  // count === 0 covers BOTH "no such lead" and "another workspace's lead", so the
+  // 404-not-403 rule holds without a second query (§6.4).
+  if (res.count === 0) throw new NotFoundError('Lead')
   const row = await repo.findByIdInWorkspace(ctx, input.leadId)
-  if (!row) throw new NotFoundError('Lead', input.leadId)
+  if (!row) throw new NotFoundError('Lead')
   return row
 }
 
 export async function softDelete(ctx: Ctx, ids: string[]): Promise<number> {
+  requireCan(ctx, ids.length > 1 ? 'leads.bulk_delete' : 'leads.delete')
   if (ids.length > 1000) throw new ConflictError('Too many leads in one call; use the bulk job.')
   return repo.softDeleteMany(ctx, ids)
 }
 ```
 
-`create` uses `Prisma.InputJsonValue` for `customFields`, not `object` — the
-narrower type is what `Lead.customFields Json @default("{}")` accepts, and
-`unknown` would not compile. Small detail, but it is the kind of thing that
-costs an implementer twenty minutes.
+Three details that cost an implementer time if undocumented:
+
+- **`Prisma.InputJsonValue` for `customFields`**, not `object` or `unknown` —
+  it is what `Lead.customFields Json @default("{}")` accepts, and the others do
+  not compile.
+- **`requireCan` is the first statement of every function**, including reads
+  (§4.2). `leads.view` is `ALL` in the matrix, so it costs an array lookup and
+  documents intent.
+- **`NotFoundError` takes a resource name, not an id.** Its constructor signature
+  is `(resource = 'Resource', options?)` — passing an id as the second argument
+  puts it in `options`, silently. Ids belong in the log line, not the message.
 
 #### 3.3.5 `index.ts`
 
@@ -798,227 +831,125 @@ options, in order of preference:
    has `emailAccountId`, so `campaigns/repo.ts` may `include: { emailAccount:
    { select: { email: true, status: true } } }`. Legal because the FK is on the
    caller's table and the join is workspace-scoped by the parent.
-3. **Never** `prisma.emailAccount.findMany()` from `campaigns/repo.ts`. That is
+3. **Never** `db.emailAccount.findMany()` from `campaigns/repo.ts`. That is
    a hidden dependency lint cannot see and the graph does not record.
 
 ---
 
 ## 4. The `Ctx` pattern
 
-### 4.1 The types
+> **Ownership note.** `07-auth-and-security.md` §9 owns `Ctx`, `requireSession`,
+> `requireWorkspace`, the capability matrix, and the 404-not-403 rule, and
+> `src/server/authz.ts` + `src/lib/errors.ts` are already on disk implementing
+> them. This section does not restate that design. It states the parts that are a
+> **backend/module** contract: the shape modules may rely on, why the parameter
+> exists at all, and how the worker gets one.
+
+### 4.1 The type modules code against
+
+As specified in `07` §9.1 and constructed only by `requireWorkspace()`:
 
 ```ts
-// src/server/ctx.ts
-import 'server-only'
-import type { Role } from '@prisma/client'
-
-/**
- * The authenticated tenant context. First parameter of EVERY service function.
- *
- * Constructed ONLY by src/server/guards.ts (web) or src/server/system-ctx.ts
- * (worker). There is no public constructor and no way to build one from request
- * input — that is the point.
- */
+// src/server/ctx.ts — owned by 07-auth-and-security.md §9.1
 export type Ctx = {
-  readonly userId: string
-  readonly workspaceId: string
-  readonly role: Role            // 'OWNER' | 'ADMIN' | 'MEMBER' from the schema
-  readonly timezone: string      // Workspace.timezone — for rendering, never storage
-  readonly requestId: string     // correlates every log line for this request
-}
-
-/** Authenticated but not yet in a workspace: register, onboarding, invite accept. */
-export type SessionCtx = {
-  readonly userId: string
-  readonly sessionId: string
-  readonly activeWorkspaceId: string | null
-  readonly requestId: string
-}
-
-/** The worker's Ctx. `userId` is the sentinel 'system'; AuditLog.actorUserId stays null. */
-export type SystemCtx = Ctx & { readonly actor: 'system' }
-
-const RANK: Record<Role, number> = { MEMBER: 1, ADMIN: 2, OWNER: 3 }
-
-export function atLeast(actual: Role, required: Role): boolean {
-  return RANK[actual] >= RANK[required]
+  userId: string
+  workspaceId: string
+  role: Role          // Prisma enum: OWNER | ADMIN | MEMBER
+  sessionId: string   // so changePassword can spare the current session
+  timezone: string    // workspace timezone; for rendering, never for storage
 }
 ```
 
-`Role` is imported from the generated client rather than redeclared, so adding a
-role to the schema is a compile error here instead of a silent gap. `RANK` is a
-total `Record<Role, …>`, so a new enum member fails to typecheck until ranked.
+**Every service function takes `Ctx` as its first parameter.** No exceptions,
+including read-only functions and job handlers. `07` §9.1 states the security half
+of the reason ("making `Ctx` the sole carrier of tenancy is what lets the
+isolation sweep be exhaustive"). The architectural half is §1.1's: a module never
+*discovers* its own tenancy, it is *told*. That is what keeps `server/ → modules/`
+one-directional, and it is why the same `leads.list` runs unchanged under a web
+request and under a worker job where no cookie exists.
 
-### 4.2 Construction — the guards
+`requireWorkspace()` is wrapped in React `cache()` (`07` §9.2), so a page with
+eight server components each calling it performs one session probe and one
+membership lookup. Modules must not cache `Ctx` themselves — a module-scope cache
+in a long-lived server process is shared across tenants (`07` §10.5 bans it).
 
-```ts
-// src/server/guards.ts
-import 'server-only'
-import { cookies, headers } from 'next/headers'
-import { redirect } from 'next/navigation'
-import type { Role } from '@prisma/client'
-import { ForbiddenError, UnauthenticatedError } from '@/lib/errors'
-import { sha256Hex } from '@/lib/crypto'
-import * as auth from '@/modules/auth'
-import * as workspace from '@/modules/workspace'
-import { atLeast, type Ctx, type SessionCtx } from './ctx'
+### 4.2 Authorization inside a service
 
-export const SESSION_COOKIE = 'im_session'
+`src/server/authz.ts` (on disk) exports `can`, `requireCan`, `MATRIX`, and
+`Capability`. The backend rule:
 
-/** Null, not a throw: layouts branch on absence, they do not catch. */
-export async function getSession(): Promise<SessionCtx | null> {
-  const jar = await cookies()
-  const token = jar.get(SESSION_COOKIE)?.value
-  if (!token) return null
-  // Only the SHA-256 hash is stored (brief §6), so we hash then look up.
-  // resolveSession() also checks revokedAt BEFORE expiresAt and slides expiry.
-  const row = await auth.resolveSession(sha256Hex(token))
-  if (!row) return null
-  const h = await headers()
-  return {
-    userId: row.userId,
-    sessionId: row.sessionId,
-    activeWorkspaceId: row.activeWorkspaceId,
-    requestId: h.get('x-request-id') ?? crypto.randomUUID(),
-  }
-}
+> **`requireCan(ctx, capability)` is the first statement of every mutating service
+> function.** Not in the action wrapper alone, not in the page.
 
-export async function requireAuth(): Promise<SessionCtx> {
-  const s = await getSession()
-  if (!s) throw new UnauthenticatedError('Sign in to continue.')
-  return s
-}
+The wrapper checks it too (`07` §13.1 step 4), which looks redundant and is not:
+a service is also reachable from a route handler and from a job handler, and only
+the service-level check covers all three entry points. `07` §9.6 states this as
+"the UI hides, the server stops"; the module-level consequence is that the check
+lives at the innermost boundary that every caller must cross.
 
-/**
- * THE tenancy constructor. Note what it does NOT accept: a workspaceId.
- * The workspace comes from Session.activeWorkspaceId, verified against a live
- * ACTIVE WorkspaceMember row on every call.
- */
-export async function requireWorkspace(minRole: Role = 'MEMBER'): Promise<Ctx> {
-  const session = await requireAuth()
-  const m = await workspace.resolveMembership(session.userId, session.activeWorkspaceId)
-  if (!m) redirect('/onboarding')          // no membership → not an error, a destination
-  if (!atLeast(m.role, minRole)) {
-    throw new ForbiddenError(`Requires ${minRole} or higher.`, {
-      required: minRole, actual: m.role,
-    })
-  }
-  return {
-    userId: session.userId,
-    workspaceId: m.workspaceId,
-    role: m.role,
-    timezone: m.timezone,
-    requestId: session.requestId,
-  }
-}
-
-/** In-service role check for an operation stricter than its module's baseline. */
-export function requireRole(ctx: Ctx, minRole: Role): void {
-  if (!atLeast(ctx.role, minRole)) {
-    throw new ForbiddenError(`Requires ${minRole} or higher.`, {
-      required: minRole, actual: ctx.role,
-    })
-  }
-}
-```
-
-`workspace.resolveMembership` filters `status: 'ACTIVE'` on `WorkspaceMember`, so
-a `SUSPENDED` member is treated as having no membership — suspension takes effect
-on the next request, with no session revocation needed.
+One thing this creates that `07` does not spell out: **modules import
+`@/server/authz`.** That is the single permitted exception to §0 rule 5
+("modules never import `src/server/**`"), and it does not create a cycle —
+`authz.ts` imports only `@prisma/client`, `@/lib/errors`, `@/lib/logger`, and the
+`Ctx` type. It reads no table, so it sits at L0 alongside `lib/` for graph
+purposes. Verified against the file on disk: its imports are exactly those four.
 
 ### 4.3 Why a client-supplied `workspaceId` is never trusted
 
-Not a philosophical position — a specific attack. Suppose `leads.list` took
-`workspaceId` as an argument and the leads page passed it from a search param:
+`07` §9.2 gives the rule and the mechanism (`.strict()` schemas make a smuggled
+`workspaceId` a *validation failure*, not a silently stripped field). The concrete
+attack, restated once because it is the reason for §3's entire repo discipline:
 
 ```
 GET /leads?workspaceId=<victim-workspace-id>&status=REPLIED
 ```
 
-The attacker is a legitimately authenticated user of *their own* workspace, so
-`requireAuth()` passes. If the workspace filter comes from input, they read the
-victim's entire replied-lead list — names, companies, email addresses. Session
-auth does not help, because the session is real. Only *resolving the tenant
-server-side* helps.
+The attacker is a legitimately authenticated user of their own workspace, so
+session auth passes. If the workspace filter came from input, they read the
+victim's replied-lead list — names, companies, addresses. Only resolving the
+tenant server-side helps.
 
-Hence three structural, not procedural, defences:
+Three structural, greppable defences follow, and they are module-layer
+obligations:
 
-1. **No zod schema in any module accepts a `workspaceId` field.** If it is not
-   in the parse output, it cannot reach a query. Grep-checkable:
+1. **No zod schema in any module accepts a `workspaceId` field.**
    `grep -rn "workspaceId" src/modules/*/schema.ts` must return nothing.
-2. **`Ctx.workspaceId` is `readonly` and `Ctx` is only constructible by
-   `server/`.** A service cannot manufacture a different one.
-3. **`repo.scope(ctx)` is the sole entry to every query in the file**, so an
-   audit is "does this file have exactly one place that names `workspaceId`",
-   which is a five-second read rather than a forty-query review.
+2. **Every action schema is `.strict()`** (`07` §13.1), so the smuggling attempt
+   is loud rather than invisible.
+3. **`repo.scope(ctx)` is the sole entry to every query in a repo file**, so
+   auditing tenancy is "does this file name `workspaceId` in exactly one place",
+   a five-second read rather than a forty-query review.
 
-When a client *does* send a `workspaceId` — usually a stale form or a
-tampering attempt — the action wrapper strips it (unknown keys are dropped by
-zod object parsing) and, if it differs from `ctx.workspaceId`, logs
-`authz.cross_workspace_attempt{requestedId}` at `warn` (taxonomy in
-`09-deployment-and-testing.md` §5.2). We do not fail the request on the strip
-alone: a legitimate stale form should not become an incident.
+### 4.4 `Ctx` in the worker
 
-### 4.4 Switching workspaces
-
-Changing workspace is a **write to `Session.activeWorkspaceId`**, not a client
-state change:
+The worker has no cookie. `Job.workspaceId` is non-null (schema: "Every job
+belongs to a tenant — including MAINTENANCE") and is where its tenancy comes
+from. `07` §9.6 specifies the synthetic identity; the module-facing contract:
 
 ```ts
-// modules/workspace/service.ts
-export async function switchWorkspace(
-  session: SessionCtx,
-  workspaceId: string,
-): Promise<void>
+// src/server/system-ctx.ts — imported by worker/registry.ts, never by app/**
+export async function systemCtxFor(workspaceId: string): Promise<Ctx>
 ```
 
-It verifies an `ACTIVE` `WorkspaceMember` for `(session.userId, workspaceId)`,
-updates `Session.activeWorkspaceId`, writes an `AuditLog` row, and the caller
-calls `revalidatePath('/', 'layout')`. Because the active workspace lives on the
-server-side session row, an open tab in workspace A cannot be tricked into
-issuing writes against workspace B, and switching in one tab correctly affects
-every tab on the next navigation.
+It resolves the workspace (throwing `NotFoundError` if purged or soft-deleted),
+and returns a `Ctx` with `userId: 'system'`, `role: 'OWNER'`, and a synthetic
+`sessionId`. Two consequences worth naming:
 
-### 4.5 `Ctx` in the worker
+- **The worker is never cross-tenant.** A handler receives a `Ctx` scoped to one
+  workspace, so §3's `repo.scope(ctx)` chokepoint protects worker paths too. There
+  is no "admin mode" that bypasses the filter. `07` §9.6 makes the same point from
+  the other direction: `enqueue()` always sets `workspaceId` from the enqueuing
+  `Ctx`, never from the payload, "a job that could name an arbitrary workspace
+  would be a cross-tenant escalation".
+- **`role: 'OWNER'` is safe** because the scope is one workspace and `requireCan`
+  exists to stop *users*, not the system. Worker-written `AuditLog` rows carry
+  `actorUserId = null`, which the schema explicitly allows.
 
-The worker has no cookie. `Job.workspaceId` is non-null (schema comment: "Every
-job belongs to a tenant — including MAINTENANCE") and is where the worker's
-tenancy comes from:
-
-```ts
-// src/server/system-ctx.ts  (imported by worker/registry.ts, not by app/**)
-import 'server-only'
-import type { SystemCtx } from './ctx'
-import * as workspace from '@/modules/workspace'
-
-export async function systemCtxFor(workspaceId: string, requestId: string): Promise<SystemCtx> {
-  const ws = await workspace.getForSystem(workspaceId)   // throws NotFound if purged
-  return {
-    userId: 'system',
-    workspaceId: ws.id,
-    role: 'OWNER',          // the worker acts with full authority within ONE tenant
-    timezone: ws.timezone,
-    requestId,
-    actor: 'system',
-  }
-}
-```
-
-Two consequences worth stating:
-
-- **The worker is never cross-tenant.** A handler gets a `SystemCtx` scoped to
-  one workspace, so the same `repo.scope(ctx)` chokepoint protects worker code
-  paths. There is no "admin mode" that bypasses the filter.
-- **`role: 'OWNER'` is safe** because the scope is a single workspace and
-  `requireRole` exists to stop *users*, not the system. Audit rows written by the
-  worker carry `actorUserId = null`, which `AuditLog` explicitly allows ("the
-  actor may be the system (worker, scheduler)").
-
-Cross-tenant maintenance (prune terminal jobs, expire invites) is the one thing
-that legitimately spans workspaces. It lives in `modules/jobs/repo.ts` and
-`modules/workspace/repo.ts` as functions named `*AcrossWorkspaces`, takes no
-`Ctx`, is reachable only from `worker/maintenance.ts`, and is enumerated
-exhaustively here:
+Cross-tenant maintenance (prune terminal jobs, expire invites, sweep rate-limit
+rows) is the one thing that legitimately spans workspaces. Those functions take
+**no `Ctx`**, live in `repo.ts`, are reachable only from `worker/maintenance.ts`,
+and are enumerated exhaustively — the `*AcrossWorkspaces` suffix is what makes an
+unreviewed seventh addition greppable:
 
 ```
 jobs.pruneTerminalJobsAcrossWorkspaces(olderThanDays)
@@ -1029,461 +960,297 @@ mailboxes.listDueForWatchRenewAcrossWorkspaces()
 analytics.listWorkspacesNeedingRollup()
 ```
 
-Six functions. Any seventh needs lead approval, and the naming suffix makes an
-unreviewed addition greppable.
-
----
+Six. Plus `rateLimit.sweepExpired()`, which touches no tenant data at all. Any
+addition needs lead approval.
 
 ## 5. The Server Action wrapper
 
-### 5.1 What it must do, in order
+> **Ownership note.** `07-auth-and-security.md` §13.1 owns `action()` — its
+> signature, its five-step order, and the `.strict()` mandate. This section states
+> the module-facing half: what an action file may contain, and how a module's
+> `Result` error becomes a typed failure.
 
-```
-raw input from the client
-      │
-      ├─1. authenticate      requireAuth() / requireWorkspace(role)   → Ctx
-      ├─2. authorize         role floor from config
-      ├─3. validate          config.input.safeParse(raw)              → typed input
-      ├─4. rate limit        after validation, keyed by ctx+input
-      ├─5. run               handler({ input, ctx })
-      ├─6. revalidate        config.revalidate(input, data)
-      ├─7. log               action.invoked / action.rejected
-      └─8. return            ActionResult<T>  — a value, never a thrown error
-```
-
-Ordering is not arbitrary. Auth precedes validation so an unauthenticated caller
-learns nothing about our input shape. Rate limiting follows validation so a
-malformed flood cannot consume a legitimate user's budget, and so the limit key
-may reference validated fields. Revalidation follows the handler so a failed
-mutation never busts a cache.
-
-### 5.2 The result type
+### 5.1 The contract, as `07` §13.1 fixes it
 
 ```ts
-// src/server/action.ts (types)
-export type ActionFailure = {
-  code: AppErrorCode                       // 'validation' | 'forbidden' | …
-  message: string                          // safe for display; never internal detail
-  fieldErrors?: Record<string, string[]>   // set only when code === 'validation'
-  retryAfterMs?: number                    // set only when code === 'rate_limited'
+// src/server/action.ts — owned by 07-auth-and-security.md §13.1
+type ActionOpts<C extends Capability> = {
+  name: string          // stable dotted name; used in logs and rate-limit keys
+  capability: C
+  schema: z.ZodType     // ALWAYS .strict()
+  rateLimit?: RateLimitRule
 }
 
-export type ActionResult<T> =
-  | { ok: true;  data: T }
-  | { ok: false; error: ActionFailure }
+export function action<S extends z.ZodType, R>(
+  opts: ActionOpts<Capability> & { schema: S },
+  handler: (ctx: Ctx, input: z.infer<S>) => Promise<R>,
+): (raw: unknown) => Promise<ActionResult<R>>
 ```
 
-A discriminated union on `ok`, so a client narrows with one `if` and TypeScript
-guarantees `data` is unreachable on the failure branch. `useActionState` consumers
-render `error.fieldErrors` next to inputs and `error.message` in an `aria-live`
-region.
+Order of operations, load-bearing at every step (`07` §13.1):
 
-### 5.3 The implementation
-
-Compiles as written.
-
-```ts
-// src/server/action.ts
-import 'server-only'
-import { z } from 'zod'
-import type { Role } from '@prisma/client'
-import {
-  AppError, InternalError, ValidationError, RateLimitedError,
-  isAppError, type AppErrorCode,
-} from '@/lib/errors'
-import { log } from '@/lib/logger'
-import { consumeRateLimit } from '@/lib/rate-limit'
-import { requireAuth, requireWorkspace } from './guards'
-import type { Ctx, SessionCtx } from './ctx'
-
-type Auth = 'public' | 'session' | 'workspace'
-
-type ActionConfig<S extends z.ZodType, T, A extends Auth> = {
-  /** Stable dotted name: 'leads.create'. Appears in every log line and metric. */
-  name: string
-  /** Default 'workspace'. 'session' = logged in, no workspace yet. 'public' = login/register. */
-  auth?: A
-  /** Role floor. Ignored unless auth === 'workspace'. */
-  role?: Role
-  input?: S
-  rateLimit?: { key: (input: z.output<S>) => string; limit: number; windowMs: number }
-  /** Cache invalidation. Runs ONLY on success. Called with the handler's output. */
-  revalidate?: (input: z.output<S>, data: T) => void | Promise<void>
-  handler: (args: {
-    input: z.output<S>
-    ctx: A extends 'workspace' ? Ctx : A extends 'session' ? SessionCtx : undefined
-  }) => Promise<T>
-}
-
-export function action<S extends z.ZodType, T, A extends Auth = 'workspace'>(
-  config: ActionConfig<S, T, A>,
-): (raw: unknown) => Promise<ActionResult<T>> {
-  return async function run(raw: unknown): Promise<ActionResult<T>> {
-    const started = Date.now()
-    const auth = (config.auth ?? 'workspace') as Auth
-    try {
-      // 1 + 2 — authenticate and authorize before looking at input at all.
-      let ctx: Ctx | SessionCtx | undefined
-      if (auth === 'workspace') ctx = await requireWorkspace(config.role)
-      else if (auth === 'session') ctx = await requireAuth()
-
-      // 3 — validate. Unknown keys (including a smuggled workspaceId) are dropped.
-      let input: z.output<S>
-      if (config.input) {
-        const parsed = config.input.safeParse(raw)
-        if (!parsed.success) {
-          const { fieldErrors } = z.flattenError(parsed.error)
-          throw new ValidationError(
-            'Check the highlighted fields.',
-            fieldErrors as Record<string, string[]>,
-          )
-        }
-        input = parsed.data as z.output<S>
-      } else {
-        input = undefined as z.output<S>
-      }
-
-      // 4 — rate limit, keyed on the validated input.
-      if (config.rateLimit) {
-        const { key, limit, windowMs } = config.rateLimit
-        await consumeRateLimit(`${config.name}:${key(input)}`, limit, windowMs)
-      }
-
-      // 5 — run.
-      const data = await config.handler({ input, ctx: ctx as never })
-
-      // 6 — invalidate caches only now that the write committed.
-      await config.revalidate?.(input, data)
-
-      log.info({ event: 'action.invoked', name: config.name, durationMs: Date.now() - started })
-      return { ok: true, data }
-    } catch (err) {
-      // redirect() and notFound() throw Next control-flow signals. They must
-      // propagate, not be swallowed into an ActionFailure.
-      rethrowFrameworkErrors(err)
-
-      const appErr: AppError = isAppError(err)
-        ? err
-        : new InternalError('Something went wrong. Please try again.', {}, { cause: err })
-
-      const failure: ActionFailure = { code: appErr.code, message: appErr.message }
-      if (appErr instanceof ValidationError) failure.fieldErrors = appErr.fieldErrors
-      if (appErr instanceof RateLimitedError) failure.retryAfterMs = appErr.retryAfterMs
-
-      const level = appErr.expected ? 'warn' : 'error'
-      log[level]({
-        event: 'action.rejected',
-        name: config.name,
-        code: appErr.code,
-        durationMs: Date.now() - started,
-        err: { name: appErr.name, message: appErr.message, stack: appErr.stack },
-      })
-      return { ok: false, error: failure }
-    }
-  }
-}
+```
+1. requireWorkspace()          unauthenticated → { ok:false, error:'unauthorized' }
+2. rate limit                  over            → { ok:false, error:'rate_limited', retryAfterSeconds }
+3. schema.parse(raw)           invalid         → { ok:false, error:'validation', issues }
+4. requireCan(ctx, capability) denied          → { ok:false, error:'forbidden' }
+5. handler(ctx, input)         AppError        → typed error; unexpected → logged, generic message
 ```
 
-`rethrowFrameworkErrors` wraps Next's `unstable_rethrow`, which exists precisely
-for this case ("wrapping an API that uses errors to interrupt control flow"):
+Rate limiting before parsing so a flood of malformed payloads cannot burn CPU on
+zod; authorization after parsing so a denial is not a validation oracle. Note this
+differs from the ordering an earlier draft of this document proposed
+(validate-then-limit); `07`'s ordering is correct and is the one implemented.
+
+`ActionResult<R>` is a discriminated union on `ok`, so a client narrows with one
+`if` and `data` is unreachable on the failure branch. `useActionState` consumers
+render field issues next to inputs and the message in an `aria-live` region.
+
+### 5.2 The one framework hazard worth stating explicitly
+
+`requireWorkspace()` calls `redirect('/onboarding')` when there is no membership
+(`07` §9.2), and `redirect()` works by **throwing** a Next control-flow signal. A
+wrapper with a `catch` that maps everything to `ActionResult` will swallow it, and
+the redirect silently stops happening while the user sees
+`{ ok: false, error: 'internal' }`.
+
+`action()` must therefore rethrow framework errors before its own handling:
 
 ```ts
-// src/server/action.ts (helper)
 import { unstable_rethrow } from 'next/navigation'
 
-function rethrowFrameworkErrors(err: unknown): void {
+try {
+  // … steps 1–5
+} catch (err) {
   unstable_rethrow(err)   // no-op unless err is a Next internal signal
+  // … map AppError → ActionResult
 }
 ```
 
-Without this, `requireWorkspace()`'s `redirect('/onboarding')` would be caught by
-our `catch` and reported to the user as `{ ok: false, code: 'internal' }`. This
-is the single most likely bug in the whole wrapper and it is silent — the
-redirect just stops happening.
+`unstable_rethrow` exists for exactly this ("wrapping an API that uses errors to
+interrupt control flow"). This is the single most likely bug in the wrapper and it
+is silent, which is why it is called out here rather than left to the reader.
 
-### 5.4 Using it
+### 5.3 What an action file may contain
 
 ```ts
 // src/app/(app)/leads/actions.ts
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { z } from 'zod'
 import { action } from '@/server/action'
 import { ConflictError, ValidationError } from '@/lib/errors'
 import * as leads from '@/modules/leads'
 
-export const createLead = action({
-  name: 'leads.create',
-  role: 'MEMBER',
-  input: leads.createLeadSchema,
-  rateLimit: { key: () => 'ws', limit: 120, windowMs: 60_000 },
-  revalidate: () => revalidatePath('/leads'),
-  handler: async ({ input, ctx }) => {
+export const createLead = action(
+  {
+    name: 'leads.create',
+    capability: 'leads.create',
+    schema: leads.createLeadSchema,
+    rateLimit: { bucket: 'leads.create', limit: 120, windowMs: 60_000 },
+  },
+  async (ctx, input) => {
     const res = await leads.create(ctx, input)
     if (!res.ok) {
-      // A Result error becomes a typed ActionFailure by throwing the matching
+      // A module Result error becomes a typed failure by throwing the matching
       // AppError. The wrapper does the mapping; the action states the meaning.
       if (res.error.kind === 'duplicate_email') {
-        throw new ConflictError('A lead with that email already exists.', {
-          existingLeadId: res.error.existingLeadId,
-        })
+        throw new ConflictError('A lead with that email already exists.')
       }
       throw new ValidationError('That lead could not be created.', {
         email: [res.error.kind],
       })
     }
-    return res.value
+    revalidatePath('/leads')
+    return res.data
   },
-})
-
-export const deleteLeads = action({
-  name: 'leads.bulkDelete',
-  role: 'ADMIN',                                    // brief §6: bulk delete is ADMIN+
-  input: z.object({ ids: z.array(z.cuid()).min(1).max(1000) }),
-  revalidate: () => revalidatePath('/leads'),
-  handler: ({ input, ctx }) => leads.softDelete(ctx, input.ids),
-})
+)
 ```
 
-Four properties follow from the shape and are worth naming:
+Five rules, all review items:
 
-- **`ctx` is never constructed in an action body.** The wrapper hands it over.
-  An action that calls `requireWorkspace()` itself is redundant and a review flag.
-- **The action file is thin.** Its whole job is: name, role, schema, revalidation
-  path, and mapping module `Result` errors to `AppError`s. Any logic in an action
-  body belongs in the service.
-- **`role` is declarative**, so "which actions are ADMIN-only" is answerable by
-  grep, which is what makes the §16 table maintainable.
-- **Progressive-enhancement `<form action={fn}>`** works because the wrapper
-  accepts `unknown`. For a raw `FormData`, the action file converts with
-  `Object.fromEntries(fd)` before calling; zod `z.coerce` handles the
-  string-typed values. We do not put `FormData` handling in the wrapper — it
-  would force every JSON caller to pay for it.
+1. **`ctx` is never constructed in an action body.** The wrapper hands it over. An
+   action calling `requireWorkspace()` itself is redundant.
+2. **The action file is thin.** Name, capability, schema, rate limit, revalidation,
+   and `Result`→`AppError` mapping. Logic belongs in the service.
+3. **`capability` is declarative**, so "which actions need which capability" is
+   answerable by grep against `authz.ts`'s `MATRIX` — that is what makes §16's
+   table maintainable rather than aspirational.
+4. **`revalidatePath` is called in the action, never in the service** (§3.1 rule
+   4): a service that imports `next/cache` cannot run in the worker.
+5. **Progressive-enhancement `<form action={fn}>`** works because the wrapper takes
+   `unknown`. For raw `FormData`, convert with `Object.fromEntries(fd)` in the
+   action file and let `z.coerce` handle string-typed values. `FormData` handling
+   does not go in the wrapper — it would tax every JSON caller.
 
-### 5.5 What the wrapper deliberately does not do
+### 5.4 What the wrapper deliberately does not do
 
-- **No CSRF token.** Next's Server Actions already require a POST with an action
-  id and enforce an origin check. Adding our own token would be ceremony. Route
-  handlers *do* need an explicit check (§7.3) because they have no such
-  protection.
-- **No automatic audit log.** Auditing is a domain decision — `AuditLog.action`
-  is a curated dotted vocabulary, not "every action that ran". Services write
-  audit rows for the events brief §6 lists.
+- **No CSRF token.** Next's Server Actions are POSTs with an action id and an
+  origin check (`07` §15.1). Route handlers *do* need `assertSameOrigin()` (§7.3)
+  because they have no such protection.
+- **No automatic audit log.** `AuditLog.action` is a curated dotted vocabulary, not
+  "every action that ran". Services call `writeAudit()` for the events brief §6
+  lists.
 - **No retries.** A retried mutation without an idempotency key is a duplicate
-  (§13). Retry is the user's decision in the UI or the queue's, with a key.
+  (§12). Retry is the user's decision, or the queue's — with a key.
 - **No response caching.** Actions are mutations.
-
----
 
 ## 6. Error model
 
-### 6.1 The hierarchy
+> **Ownership note.** `src/lib/errors.ts` and `src/lib/result.ts` are **already on
+> disk**, and `07-auth-and-security.md` §10.2 owns the 404-not-403 rule. This
+> section describes what is implemented, not a proposal, and then adds the part no
+> other doc covers: the decision rule for throwing versus returning, and how
+> Prisma error codes map.
 
-`src/lib/errors.ts`. Compiles as written.
+### 6.1 The hierarchy as implemented
 
 ```ts
-// src/lib/errors.ts
-export type AppErrorCode =
-  | 'not_found' | 'forbidden' | 'unauthenticated' | 'validation'
-  | 'conflict' | 'rate_limited' | 'provider_error' | 'unavailable' | 'internal'
+// src/lib/errors.ts (on disk)
+export type ErrorCode =
+  | 'NOT_FOUND' | 'FORBIDDEN' | 'UNAUTHORIZED' | 'VALIDATION'
+  | 'CONFLICT' | 'RATE_LIMITED' | 'PROVIDER_ERROR' | 'UNAVAILABLE' | 'INTERNAL'
 
-export abstract class AppError extends Error {
-  abstract readonly code: AppErrorCode
-  abstract readonly httpStatus: number
-  /** false ⇒ log at error and treat as a bug. true ⇒ a normal outcome. */
-  readonly expected: boolean = true
-
+export class AppError extends Error {
+  readonly code: ErrorCode
+  readonly status: number
+  /** Safe to show a user. Never embed internal detail or secrets here. */
+  readonly publicMessage: string
   constructor(
-    message: string,
-    readonly meta: Readonly<Record<string, unknown>> = {},
-    options?: { cause?: unknown },
-  ) {
-    super(message, options)
-    this.name = new.target.name
-  }
+    code: ErrorCode, status: number, publicMessage: string,
+    options?: { cause?: unknown; internalMessage?: string },
+  )
 }
 
-export class NotFoundError extends AppError {
-  readonly code = 'not_found' as const
-  readonly httpStatus = 404
-  constructor(resource: string, id?: string) {
-    super(`${resource} not found`, id === undefined ? { resource } : { resource, id })
-  }
-}
+export class NotFoundError    extends AppError  // 404
+export class UnauthorizedError extends AppError // 401
+export class ForbiddenError   extends AppError  // 403
+export class ValidationError  extends AppError  // 422, + fieldErrors
+export class ConflictError    extends AppError  // 409
+export class RateLimitedError extends AppError  // 429, + retryAfterSeconds
+export class ProviderError    extends AppError  // 502, + provider, retryable
+export class UnavailableError extends AppError  // 503
 
-export class ForbiddenError extends AppError {
-  readonly code = 'forbidden' as const
-  readonly httpStatus = 403
-}
-
-export class UnauthenticatedError extends AppError {
-  readonly code = 'unauthenticated' as const
-  readonly httpStatus = 401
-}
-
-export class ValidationError extends AppError {
-  readonly code = 'validation' as const
-  readonly httpStatus = 422
-  constructor(message: string, readonly fieldErrors: Record<string, string[]> = {}) {
-    super(message, { fieldErrors })
-  }
-}
-
-export class ConflictError extends AppError {
-  readonly code = 'conflict' as const
-  readonly httpStatus = 409
-}
-
-export class RateLimitedError extends AppError {
-  readonly code = 'rate_limited' as const
-  readonly httpStatus = 429
-  constructor(message: string, readonly retryAfterMs: number) {
-    super(message, { retryAfterMs })
-  }
-}
-
-/** A third party failed. `retryable` decides whether the queue backs off or dead-letters. */
-export class ProviderError extends AppError {
-  readonly code = 'provider_error' as const
-  readonly httpStatus = 502
-  constructor(
-    message: string,
-    readonly provider: string,
-    readonly retryable: boolean,
-    meta: Record<string, unknown> = {},
-  ) {
-    super(message, { ...meta, provider, retryable })
-  }
-}
-
-/** OUR dependency is down (DB unreachable, migration pending). */
-export class UnavailableError extends AppError {
-  readonly code = 'unavailable' as const
-  readonly httpStatus = 503
-}
-
-/** The only one with expected = false. If you construct this by hand, reconsider. */
-export class InternalError extends AppError {
-  readonly code = 'internal' as const
-  readonly httpStatus = 500
-  override readonly expected = false
-}
-
-export function isAppError(e: unknown): e is AppError {
-  return e instanceof AppError
-}
-
-export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E }
-export const Ok  = <T>(value: T): Result<T, never> => ({ ok: true, value })
-export const Err = <E>(error: E): Result<never, E> => ({ ok: false, error })
+export function isAppError(e: unknown): e is AppError
+export function toPublicError(e: unknown): { code: ErrorCode; status: number; message: string }
 ```
 
-Design notes:
+Three implementation choices worth understanding before writing code against it:
 
-- **`abstract readonly code` with `as const` in each subclass** gives exhaustive
-  narrowing in a `switch (err.code)` without a hand-maintained map.
-- **`this.name = new.target.name`** so a minified production bundle still logs
-  `NotFoundError`, not `Error`.
-- **`cause` is used, not swallowed.** `new InternalError(msg, {}, { cause: err })`
-  keeps the original stack for the log while showing the user a safe message.
-- **`meta` is `Record<string, unknown>`, never `any`.** Lint bans `any`.
-- **`ProviderError` is the seam to the queue.** `06-jobs-and-sending-engine.md`
-  §6.6 declares `RetryableError`/`TerminalError`/`DeferError extends AppError`.
-  Those are queue-control classes and live in `modules/jobs/`; `ProviderError`
-  is the domain fact. Classification maps one to the other:
-  `ProviderError.retryable === true` → `RetryableError`, `false` →
-  `TerminalError`. Both directions are in `modules/sending/providers/gmail.ts`.
+- **`publicMessage` vs `message` is the whole safety mechanism.** `super()` receives
+  `options.internalMessage ?? publicMessage`, so `err.message` may carry detail
+  (a Prisma message, a provider body) while `err.publicMessage` is the only thing
+  a client ever sees. `toPublicError` collapses anything that is not an `AppError`
+  to a generic 500. **Never send `err.message` to a client**; send
+  `toPublicError(err).message`.
+- **There is no `InternalError` class and no `expected` flag.** An unexpected
+  throw stays whatever it was and `toPublicError` handles it. Classification for
+  logging is therefore `isAppError(e)` — true means a modelled outcome (`warn`),
+  false means a bug (`error`).
+- **`RateLimitedError` carries `retryAfterSeconds`, not milliseconds.** It maps
+  directly to the `Retry-After` header, which is defined in seconds
+  (`07` §14.5).
 
-### 6.2 The one error we do not model
+There is deliberately **no `TimeoutError`**. A DB statement timeout surfaces as
+`UnavailableError`; a provider timeout as `ProviderError({ retryable: true })`. A
+third class would force every consumer to handle a case whose correct response is
+always one of those two.
 
-There is no `TimeoutError`. A DB statement timeout surfaces as
-`UnavailableError`; a provider timeout surfaces as
-`ProviderError(retryable: true)`. A separate class would force every consumer to
-handle a third case whose correct response is always one of those two.
+**`ProviderError` is the seam to the queue.** `06` §6.6 defines the queue-control
+classes (retryable / terminal / defer) in `modules/jobs/`; `ProviderError` is the
+domain fact and `retryable` is the bit the queue reads. The mapping lives in
+`modules/sending/providers/gmail.ts` and nowhere else.
 
-### 6.3 Throw vs `Result<T, E>` — the decision rule
+### 6.2 `Result` as implemented
+
+```ts
+// src/lib/result.ts (on disk)
+export type Result<T, E = string> = { ok: true; data: T } | { ok: false; error: E }
+export function ok<T>(data: T): Result<T, never>
+export function err<E>(error: E): Result<never, E>
+export function isOk / isErr / unwrap
+```
+
+The success field is **`data`**, not `value`, and the constructors are lowercase
+`ok` / `err`. Matching `ActionResult`'s `{ ok, data }` shape is deliberate: a
+service `Result` flows into an action result without a rename.
+
+### 6.3 Throw vs `Result` — the decision rule
 
 > **Throw when the caller cannot reasonably do anything except show an error.
 > Return a `Result` when a specific failure has its own UI or its own next step.**
 
 | Situation | Mechanism | Why |
 |---|---|---|
-| Lead id not in this workspace | `throw NotFoundError` | page renders 404; there is no "handle" |
-| Caller is `MEMBER`, needs `ADMIN` | `throw ForbiddenError` | one response: tell them |
-| Malformed input | `throw ValidationError` (wrapper does it) | field errors are the UI |
+| Lead id not in this workspace | `throw NotFoundError` | page renders 404; nothing to "handle" |
+| Caller's role lacks the capability | `throw ForbiddenError` (via `requireCan`) | one response: tell them |
+| Malformed input | `throw ValidationError` (wrapper does it) | field errors *are* the UI |
 | Duplicate email on lead create | `Result` → `duplicate_email` | UI offers "open the existing lead" |
-| CSV row invalid | `Result` per row | invalid rows are *reported*, valid rows import |
-| Lead is suppressed at enrollment | `Result` → `suppressed` | enrollment continues for the rest; count shown |
-| Campaign has no sendable mailbox | `Result` → `no_eligible_mailbox` | launch dialog names the fix |
-| Gmail 429 | `throw ProviderError(retryable)` | the queue handles it; no UI involved |
-| Gmail 400 invalid recipient | `throw ProviderError(!retryable)` | dead-letter + suppress the lead |
-| DB unreachable | let it propagate → `internal`/`unavailable` | nothing to decide |
+| CSV row invalid | `Result` per row | valid rows import, invalid rows are reported |
+| Lead suppressed at enrollment | `Result` → `suppressed` | the rest enroll; a count is shown |
+| Campaign has no sendable mailbox | `Result` → `no_eligible_mailbox` | the launch dialog names the fix |
+| Gmail 429 | `throw ProviderError({ retryable: true })` | the queue handles it; no UI involved |
+| Gmail 400 invalid recipient | `throw ProviderError({ retryable: false })` | dead-letter + suppress the lead |
+| DB unreachable | let it propagate | nothing to decide |
 | A batch where some items fail | `Result` with per-item outcomes | partial success is the truth |
 
-The failure mode this rule prevents: `Result` everywhere. Then every call site
-is `if (!r.ok) return r` noise, and the type of a five-step service function
-becomes a union of eleven error kinds nobody handles. `Result` earns its keep
-only where a branch actually exists.
+The failure mode this prevents is `Result` everywhere: then every call site is
+`if (!r.ok) return r` noise and a five-step service function's type is a union of
+eleven error kinds nobody handles.
 
-Corollary: **a `Result` error kind must have a named UI treatment.** If nobody
-can say what the screen does differently, it should have been a throw.
+Corollary: **a `Result` error kind must have a named UI treatment.** If nobody can
+say what the screen does differently, it should have been a throw.
 
-### 6.4 The 404-not-403 rule
+### 6.4 The 404-not-403 rule, as a repo obligation
 
-**Cross-workspace access returns 404. Always. No exceptions.**
-
-403 says "this exists, and it is not yours" — a membership oracle. An attacker
-enumerating cuids learns which ids are live in other tenants, and 404-vs-403 on
-`/campaigns/<id>` leaks whether a competitor runs a campaign we happen to know
-the id of.
-
-Mechanically this is free, because the workspace filter is inside the query:
+`07` §10.2 owns the rule. The module-layer mechanics, because this is where it is
+either free or impossible:
 
 ```ts
-// Correct: one query, cannot distinguish "absent" from "foreign".
+// Correct: one query. Cannot distinguish "absent" from "foreign".
 const row = await db.lead.findFirst({ where: { id, workspaceId: ctx.workspaceId } })
-if (!row) throw new NotFoundError('Lead', id)
+if (!row) throw new NotFoundError('Lead')
 
-// WRONG: two queries, and the second one leaks.
+// WRONG: two steps, and the second one is the oracle.
 const row = await db.lead.findUnique({ where: { id } })
-if (!row) throw new NotFoundError('Lead', id)
-if (row.workspaceId !== ctx.workspaceId) throw new ForbiddenError('Not your lead.')
+if (!row) throw new NotFoundError('Lead')
+if (row.workspaceId !== ctx.workspaceId) throw new ForbiddenError('view this lead')
 ```
 
-The wrong version is the natural thing to write, which is why the rule is stated
-and why `repo.scope(ctx)` exists: with the filter in the `where`, there is no
-place to put the leak. `findUnique({ where: { id } })` on a tenant-owned table is
-a review rejection.
+The wrong version is the natural thing to write, which is why `repo.scope(ctx)`
+exists: with the filter inside the `where`, there is no place to put the leak.
+**`findUnique` / `update` / `delete` by bare id on a tenant-owned model is a review
+rejection** — `07` §10.1 bans them and `09` §9.3's isolation sweep fails CI on an
+uncovered repo export. Use `findFirst` and `updateMany` / `deleteMany` with
+`workspaceId` in the `where`, and read the returned `count` to detect "the caller
+named rows it does not own".
 
-`ForbiddenError` is reserved for **role** failures on a resource the caller's
-workspace does own — a `MEMBER` pressing "delete all leads". There, 403 leaks
-nothing: they already know the workspace exists.
+`ForbiddenError` is thrown **only** by `requireCan` and the explicit role guards in
+`authz.ts`. A repo miss is always `NotFoundError`.
 
 ### 6.5 Error → HTTP → UI
 
-| `AppError` | HTTP (route handler) | Server Component | Action result | UI |
+| Class | HTTP (route handler) | Server Component | Action result | UI |
 |---|---|---|---|---|
-| `NotFoundError` | 404 | `notFound()` → in-shell 404 | `code: 'not_found'` | "Not found" + back link |
-| `ForbiddenError` | 403 | in-shell unauthorized state | `code: 'forbidden'` | "You do not have permission" + who to ask |
-| `UnauthenticatedError` | 401 | `redirect('/login?next=…')` | `code: 'unauthenticated'` | client redirects to login |
-| `ValidationError` | 422 | *(cannot occur — no user input)* | `code: 'validation'` + `fieldErrors` | inline field errors, `aria-live` summary |
-| `ConflictError` | 409 | `error.tsx` | `code: 'conflict'` | specific message + the alternative action |
-| `RateLimitedError` | 429 + `Retry-After` | rate-limited state | `code: 'rate_limited'` + `retryAfterMs` | "Try again in Ns", control disabled with countdown |
-| `ProviderError` | 502 | disconnected/degraded state | `code: 'provider_error'` | honest "Gmail is not responding" + Retry |
-| `UnavailableError` | 503 | `error.tsx` | `code: 'unavailable'` | "Temporarily unavailable" + Retry |
-| `InternalError` / unknown | 500 | `error.tsx` | `code: 'internal'` | generic message + Retry; **detail only in logs** |
+| `NotFoundError` | 404 | `notFound()` → in-shell 404 | `NOT_FOUND` | "Not found" + back link |
+| `ForbiddenError` | 403 | in-shell unauthorized state | `FORBIDDEN` | "You do not have permission" + who to ask |
+| `UnauthorizedError` | 401 | `redirect('/login?next=…')` | `UNAUTHORIZED` | client redirects to login |
+| `ValidationError` | 422 | *(cannot occur — no user input)* | `VALIDATION` + `fieldErrors` | inline field errors + `aria-live` summary |
+| `ConflictError` | 409 | `error.tsx` | `CONFLICT` | specific message + the alternative action |
+| `RateLimitedError` | 429 + `Retry-After` | rate-limited state | `RATE_LIMITED` + `retryAfterSeconds` | real reset time, control disabled with countdown |
+| `ProviderError` | 502 | disconnected/degraded state | `PROVIDER_ERROR` | honest "Gmail is not responding" + Retry |
+| `UnavailableError` | 503 | `error.tsx` | `UNAVAILABLE` | "Temporarily unavailable" / "not configured yet" |
+| anything else | 500 | `error.tsx` | `INTERNAL` | generic message + Retry; **detail only in logs** |
 
 Two hard rules on the boundary:
 
-1. **A 500 body never contains `err.message` from an unknown error.** It may
-   carry a database error, a file path, or a fragment of a query. The user gets
-   a fixed string plus the `requestId`; the detail is in the log line keyed by
-   that id.
+1. **A 500 body never contains a raw `err.message`.** It may carry a database
+   error, a file path, or a query fragment. The client gets `toPublicError`'s fixed
+   string plus the `requestId`; the detail is in the log line keyed by that id.
 2. **Server Components translate, they do not catch-and-render.** A page calls
-   `notFound()` or `redirect()` and lets everything else hit `error.tsx`. A page
-   that try/catches around a module call and renders its own error box
-   duplicates the boundary and loses the reset button.
+   `notFound()` or `redirect()` and lets everything else reach `error.tsx`. A page
+   that try/catches a module call and renders its own error box duplicates the
+   boundary and loses the reset button.
 
 ```
         module service
@@ -1491,7 +1258,7 @@ Two hard rules on the boundary:
    ┌──────────┴──────────┬────────────────────┐
    ▼                     ▼                    ▼
  action()            page/layout        route handler
- catches →           translates →       maps →
+ catches →           translates →       toPublicError →
  ActionResult        notFound()         Response(status)
                      redirect()         + { code, message, requestId }
  │                   or bubbles to
@@ -1501,20 +1268,22 @@ Two hard rules on the boundary:
 
 ### 6.6 Prisma error codes we interpret
 
-Only these three. Anything else propagates as `InternalError`.
+Only these three. Anything else propagates and becomes a 500.
 
-| Prisma code | PG | Meaning | Mapping |
+| Prisma | PG | Meaning | Mapping |
 |---|---|---|---|
 | `P2002` | 23505 | unique violation | `ConflictError`, or a `Result` dedupe branch (`Lead(workspaceId,email)`, `Job.dedupeKey`, `ScheduledEmail.dedupeKey`, `EmailEvent.dedupeKey`) |
 | `P2003` | 23503 | FK violation | `ConflictError('Referenced record no longer exists.')` — normally a concurrent delete |
 | `P2025` | — | record required but not found | `NotFoundError` |
 
-`P2002` on a `dedupeKey` is **not an error** in the queue path: the schema states
-"a second insert with the same key raises 23505 and the caller treats that as
+Detected with `e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002'`.
+`code` is typed `string`, not a literal union, so there is no exhaustiveness help
+from the compiler — keep the checks in one helper per repo rather than scattered.
+
+`P2002` on a `dedupeKey` is **not an error** in the queue path: the schema states "a
+second insert with the same key raises 23505 and the caller treats that as
 success". `jobs.enqueue` returns `{ created: false }`. Never surface it as a
 conflict — a deduped enqueue is the system working.
-
----
 
 ## 7. Route handlers vs Server Actions
 
@@ -1562,37 +1331,48 @@ explicit. The shared helper enforces the order.
 import 'server-only'
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { AppError, InternalError, isAppError } from '@/lib/errors'
-import { log } from '@/lib/logger'
+import { isAppError, toPublicError } from '@/lib/errors'
+import { logger } from '@/lib/logger'
 
 type RouteAuth = 'workspace' | 'session' | 'worker-token' | 'webhook' | 'public-token'
 
 export type RouteConfig<S extends z.ZodType, T> = {
   name: string
   auth: RouteAuth
-  /** Required for every non-GET with auth 'workspace' | 'session'. */
+  /** Mandatory for every non-GET with cookie auth. Calls assertSameOrigin(). */
   requireSameOrigin?: boolean
+  rateLimit?: RateLimitRule
   input?: S
-  handler: (args: { input: z.output<S>; req: Request; ctx: unknown }) => Promise<T>
+  handler: (args: { input: z.output<S>; req: Request; ctx: Ctx | null }) => Promise<T>
 }
 
 export function jsonRoute<S extends z.ZodType, T>(config: RouteConfig<S, T>) {
   return async function handle(req: Request): Promise<Response> {
     const requestId = req.headers.get('x-request-id') ?? crypto.randomUUID()
     try {
-      // ... auth by mode, same-origin check, zod parse (see below)
-      const data = await config.handler({ input: undefined as z.output<S>, req, ctx: undefined })
+      // auth by mode → same-origin check → rate limit → zod parse → handler
+      const data = await config.handler({ input: undefined as z.output<S>, req, ctx: null })
       return NextResponse.json(data, { headers: { 'x-request-id': requestId } })
     } catch (err) {
-      const e: AppError = isAppError(err) ? err : new InternalError('Internal error', {}, { cause: err })
-      log[e.expected ? 'warn' : 'error']({
-        event: 'http.request.completed', name: config.name,
-        status: e.httpStatus, requestId,
-        err: { name: e.name, message: e.message, stack: e.stack },
-      })
+      // toPublicError collapses anything that is not an AppError to a generic 500,
+      // so an internal message can never reach the client (§6.1).
+      const pub = toPublicError(err)
+      const headers: Record<string, string> = { 'x-request-id': requestId }
+      if (pub.code === 'RATE_LIMITED' && isAppError(err) && 'retryAfterSeconds' in err) {
+        headers['Retry-After'] = String(err.retryAfterSeconds)
+      }
+      if (isAppError(err)) {
+        logger.warn('http.request.completed', {
+          name: config.name, status: pub.status, code: pub.code, requestId,
+        })
+      } else {
+        logger.error('http.request.completed', err, {
+          name: config.name, status: 500, requestId,
+        })
+      }
       return NextResponse.json(
-        { code: e.code, message: e.expected ? e.message : 'Internal error', requestId },
-        { status: e.httpStatus, headers: { 'x-request-id': requestId } },
+        { code: pub.code, message: pub.message, requestId },
+        { status: pub.status, headers },
       )
     }
   }
@@ -1675,8 +1455,8 @@ signal we treat as fact.
 | Tool | Use when | Cost |
 |---|---|---|
 | A single statement (`updateMany` with a guard in `where`, `createMany`, `INSERT … ON CONFLICT`) | the atomic unit is one row-set | none — no explicit tx at all |
-| `prisma.$transaction([...])` (batch) | 2+ independent writes, no reads between them | one round trip, connection held briefly |
-| `prisma.$transaction(async (tx) => …)` (interactive) | a write depends on a read taken in the same tx | holds a pooled connection for the whole callback |
+| `db.$transaction([...])` (batch) | 2+ independent writes, no reads between them | one round trip, connection held briefly |
+| `db.$transaction(async (tx) => …)` (interactive) | a write depends on a read taken in the same tx | holds a pooled connection for the whole callback |
 
 **Reach for the first one first.** Most "I need a transaction" instincts are
 actually "I need a conditional update", and a conditional update is atomic on its
@@ -1754,7 +1534,7 @@ serialisation point, not `SERIALIZABLE` isolation.**
 Any state change that must cause background work:
 
 ```ts
-await prisma.$transaction(async (tx) => {
+await db.$transaction(async (tx) => {
   await tx.campaign.update({
     where: { id },                                   // pre-verified in-workspace
     data: { status: 'ACTIVE', launchedAt: new Date() },
@@ -1872,198 +1652,160 @@ The *work* then happens with no transaction open, bounded by `leaseExpiresAt`.
 This is why the design survives a transaction-mode pooler (`09` §3.4) and why a
 crashed worker's jobs recover without anything held open.
 
-Note `priority DESC` here: `Job.priority` is documented in the schema as "Higher
-runs first", while `06-jobs-and-sending-engine.md` §5 uses "lower number runs
-first" with band numbers 10–200. Flagged in §17 — one of them must change, and
-the SQL above follows the schema.
+Note `priority DESC`: the schema documents `Job.priority` as "Higher runs first",
+and `06` §0 and §5.1 now follow it (bands 90 = stop propagation … 10 = rollups), so
+every `ORDER BY priority` in the codebase is `DESC`. An earlier draft of `06` used
+the opposite convention; it does not any more, and there is nothing for the lead to
+resolve. The trap this leaves is real, though: `priority: 10` means *lowest*
+urgency, which reads backwards to anyone who has used a queue where 1 is highest.
+Use the band names from `06` §5.1 rather than bare numbers in code.
 
 ---
 
 ## 9. Connection management
 
-### 9.1 `src/lib/db.ts` — the whole file
+### 9.1 `src/lib/db.ts` — as implemented
 
-Prisma 7 removed `url` and `directUrl` from the `datasource` block entirely
-(`INTEGRATION-NOTES.md` §1). The block carries `provider` only; `PrismaClient`
-takes a **driver adapter**. Any code or doc showing `datasources: { db: { url } }`
-or a URL in `schema.prisma` is Prisma ≤6 and wrong for this repo.
-
-Compiles as written, verified against `@prisma/adapter-pg@7.10.0` and
-`@types/pg@8.23.1`.
+**This file is already on disk.** Prisma 7 removed `url` and `directUrl` from the
+`datasource` block entirely (`INTEGRATION-NOTES.md` §1): the block carries
+`provider` only, Migrate reads `datasource.url` from `prisma.config.ts`, and
+`PrismaClient` takes a **driver adapter**.
 
 ```ts
-// src/lib/db.ts
+// src/lib/db.ts (on disk)
 import 'server-only'
 import { PrismaClient } from '@prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
-import { Pool } from 'pg'
+import { env } from './env'
 
-/**
- * Two access patterns, two budgets (09-deployment-and-testing.md §3.4).
- * Selected by IM_DB_PROFILE, which the worker sets and the web app does not.
- * Encoding the profile in an env var rather than a build flag means one image
- * runs both processes.
- */
-type Profile = 'web' | 'worker'
+const isWorker = process.env.INSTANT_MAIL_PROCESS === 'worker'
 
-const PROFILES: Record<Profile, {
-  max: number
-  statementTimeoutMs: number
-  idleTimeoutMs: number
-}> = {
-  // Web: many short queries, bursty. 10 per replica × 3 replicas = 30 of ~100.
-  web:    { max: 10, statementTimeoutMs: 10_000, idleTimeoutMs: 10_000 },
-  // Worker: few longer transactions, steady. WORKER_CONCURRENCY(4) + 4 = 8.
-  worker: { max:  8, statementTimeoutMs: 60_000, idleTimeoutMs: 30_000 },
-}
-
-function resolveProfile(): Profile {
-  return process.env.IM_DB_PROFILE === 'worker' ? 'worker' : 'web'
-}
-
-function createPrisma(): PrismaClient {
-  const profile = resolveProfile()
-  const p = PROFILES[profile]
-
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: p.max,
-    idleTimeoutMillis: p.idleTimeoutMs,
-    connectionTimeoutMillis: 5_000,
-    // Server-side kill switch: a runaway query cannot pin a connection forever.
-    // Set on the connection, so it survives a Prisma-side timeout being missed.
-    statement_timeout: p.statementTimeoutMs,
-    // Shows up in pg_stat_activity — the difference between a five-minute
-    // diagnosis and a fifty-minute one during an incident.
-    application_name: `instantmail-${profile}`,
-    // The worker should be able to exit cleanly on SIGTERM; the web process
-    // keeps its pool warm.
-    allowExitOnIdle: profile === 'worker',
+function createClient() {
+  const adapter = new PrismaPg({
+    connectionString: env.DATABASE_URL,
+    // Headroom over worker concurrency so a job never waits on the pool while
+    // holding a lease.
+    max: isWorker ? env.WORKER_CONCURRENCY + 2 : 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
   })
-
-  const adapter = new PrismaPg(pool, { schema: 'public' })
-
   return new PrismaClient({
     adapter,
-    log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
-    // Defaults for EVERY $transaction; §8.4 rule 2.
-    transactionOptions: { maxWait: 5_000, timeout: 15_000 },
+    log: env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
   })
 }
 
-/**
- * Next dev HMR recreates modules on every edit. Without this cache each edit
- * leaks a Pool, and after twenty saves Postgres refuses connections with
- * "too many clients already" — which reads like a pooling bug and is not.
- */
-const globalForPrisma = globalThis as unknown as { __imPrisma?: PrismaClient }
+// Next dev HMR re-evaluates modules on every edit; without the global cache we
+// leak a pool per reload until Postgres refuses connections.
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient }
 
-export const prisma: PrismaClient = globalForPrisma.__imPrisma ?? createPrisma()
+export const db = globalForPrisma.prisma ?? createClient()
 
-if (process.env.NODE_ENV !== 'production') {
-  globalForPrisma.__imPrisma = prisma
-}
+if (env.NODE_ENV !== 'production') globalForPrisma.prisma = db
 ```
+
+**The export is `db`, not `prisma`.** Every repo and service file writes
+`import { db } from '@/lib/db'`, and §3.3 does so throughout. A repo function's
+optional transaction parameter is therefore named `database` to avoid shadowing it.
 
 Details that are load-bearing:
 
-- **`new PrismaPg(pool, …)` takes our `Pool`, not a connection string.** The
-  string overload exists, but then pool sizing is Prisma's default
-  (`cpus × 2 + 1`), which is wrong for both profiles. Owning the `Pool` is how
-  `max`, `statement_timeout`, and `application_name` get set at all.
-- **`connectionString: process.env.DATABASE_URL`** — the pool reads the env var
-  directly. There is no schema URL to read and no `datasources` override.
-- **The prod `log` level is `['error']`, not `['query']`.** Query logging on a
-  send path prints recipient addresses, and brief §9 forbids that.
-- **`process.env.NODE_ENV !== 'production'`** guards the global cache, not
+- **Profile selection is `INSTANT_MAIL_PROCESS === 'worker'`**, read at module
+  evaluation. `worker/index.ts` must set it **before** any import that transitively
+  reaches `db.ts`, or the worker silently gets the web pool. Put the assignment on
+  the first line of the file and assert it after imports.
+- **`connectionString` is passed to `PrismaPg`, not a bare `Pool`.** Both overloads
+  exist. The string form is used here and takes the `pg` `PoolConfig` fields
+  inline, which is where `max` comes from — without it, sizing would be Prisma's
+  `cpus × 2 + 1` default, wrong for both profiles.
+- **The prod `log` level is `['error']`, never `['query']`.** Query logging on a send
+  path prints recipient addresses, and brief §9 forbids that.
+- **`env.NODE_ENV !== 'production'`** guards the global cache, not
   `=== 'development'`, so `test` also reuses one client across test files.
-- **`serverExternalPackages`** in `next.config.ts` already lists
-  `@prisma/client`, `@prisma/adapter-pg`, `pg`, so a stray client-side import
-  fails at build instead of shipping a broken chunk.
+- **`serverExternalPackages`** in `next.config.ts` lists `@prisma/client`,
+  `@prisma/adapter-pg`, and `pg`, so a stray client-side import fails at build
+  rather than shipping a broken chunk.
+
+Two settings this document recommends adding, both diagnostic rather than
+functional, and both cheap:
+
+```ts
+  application_name: isWorker ? 'instantmail-worker' : 'instantmail-web',
+  statement_timeout: isWorker ? 60_000 : 10_000,
+```
+
+`application_name` is the difference between a five-minute and a fifty-minute
+diagnosis in `pg_stat_activity` during an incident. `statement_timeout` is a
+server-side kill switch: a runaway query cannot pin a connection indefinitely even
+if a Prisma-side timeout is missed. `09` §3.4 specifies both timeout values.
 
 ### 9.2 The worker's client
 
-The worker imports the same module. `worker/index.ts` sets the profile before any
-import that could touch `db.ts`:
-
-```ts
-// worker/index.ts — FIRST lines of the file, before other imports.
-process.env.IM_DB_PROFILE = 'worker'
-```
-
-Setting it after importing a module that transitively imports `db.ts` silently
-gets the web profile, because `createPrisma()` already ran at module evaluation.
-An assertion in `worker/index.ts` guards it:
-
-```ts
-if (resolveProfileForAssert() !== 'worker') {
-  throw new Error('db.ts initialised before IM_DB_PROFILE was set — move the assignment up')
-}
-```
-
-On `SIGTERM` the worker stops leasing, waits for in-flight jobs, then
-`await prisma.$disconnect()`. The web process never disconnects — the pool lives
-as long as the process.
+The worker imports the same module and the same singleton. On `SIGTERM` it stops
+leasing, waits for in-flight jobs, then `await db.$disconnect()`. **The web process
+never disconnects** — the pool lives as long as the process.
 
 ### 9.3 Budget
 
-From `09-deployment-and-testing.md` §3.4, restated because §8.4's rules only make
-sense against these numbers:
+From `09` §3.4, restated because §8.4's rules only make sense against these
+numbers:
 
 ```
 managed Postgres, max_connections = 100
   web      3 replicas × 10                 = 30
-  worker   1 replica  ×  8                 =  8
+  worker   1 replica  × (4 + 2) = 6        =  6
   migrate deploy (transient)               =  1
   operator psql / platform dashboard       =  5
   reserved superuser                       =  3
   ────────────────────────────────────────────
-  peak                                     = 47   ✓ ~50% headroom
+  peak                                     = 45   ✓ ~55% headroom
 ```
 
-Local dev: one web process at 10 and one worker at 8 against the user-space
-cluster on port 5433, whose `max_connections` is the initdb default of 100. Never
-a constraint locally.
+`09` §3.4 budgets the worker at `WORKER_CONCURRENCY + 4` (8); the code on disk uses
+`+ 2` (6). Both fit comfortably; the code is the operative number and the doc's
+table should be corrected to match rather than the reverse — `+2` is the tighter,
+more defensible figure since a leased job's work happens outside any transaction.
+
+Local dev: one web process at 10 and one worker at 6 against the user-space cluster
+on port 5433, whose `max_connections` is the initdb default of 100. Never a
+constraint locally.
 
 ### 9.4 pgbouncer
 
-We have no pooler today; the schema comment says so explicitly and says to add
-`directUrl` "the same day a pooler lands, and not before". When one lands, four
-things change and nothing else:
+There is no pooler today; the schema comment says to add `directUrl` "the same day
+a pooler lands, and not before". When one lands, four things change and nothing
+else:
 
-1. `DATABASE_URL` points at the pooler in **transaction mode**; `max` drops to
-   `1` per serverless invocation (each invocation is its own process; the pooler
-   does the pooling).
+1. `DATABASE_URL` points at the pooler in **transaction mode**; `max` drops to `1`
+   per serverless invocation (each invocation is its own process; the pooler does
+   the pooling).
 2. `DIRECT_DATABASE_URL` must be set and non-empty. `prisma.config.ts` already
    prefers it for Migrate, and DDL through a transaction pooler fails.
-3. **Prepared statements must be disabled.** With `@prisma/adapter-pg` this is a
-   `pg` concern, not a `?pgbouncer=true` query param: transaction-mode pooling
-   gives a different backend per transaction, so a named prepared statement
-   cached against one backend is not there on the next. `PrismaPgOptions` exposes
-   `statementNameGenerator`, and the adapter does not cache prepared statements
-   unless one is provided — so **do not provide one under a transaction pooler.**
-   Leave it unset, which is the default in §9.1.
+3. **Prepared statements must not be cached.** With `@prisma/adapter-pg` this is a
+   `pg` concern, not a `?pgbouncer=true` query param: transaction-mode pooling gives
+   a different backend per transaction, so a named statement cached against one
+   backend is absent on the next. `PrismaPgOptions.statementNameGenerator` is the
+   control, and the adapter caches nothing unless one is supplied — so **do not
+   supply one under a transaction pooler.** Leave it unset, which is what the file
+   on disk does.
 4. `SELECT … FOR UPDATE SKIP LOCKED` still works, because §8.5's lease is one
-   statement and the work happens outside any transaction. Session-level state
-   (`LISTEN/NOTIFY`, advisory locks held across statements, `SET` without
-   `SET LOCAL`) does **not** work in transaction mode. This matters for one thing
-   in the current design: `worker/maintenance.ts` uses
-   `pg_try_advisory_lock` to serialise maintenance ticks. Under a transaction
-   pooler that must become `pg_advisory_xact_lock` inside a transaction, which
-   releases on commit. Noted here so the migration to a pooler is a checklist and
-   not an investigation.
+   statement and the work happens outside any transaction. **Session-level state does
+   not**: `LISTEN/NOTIFY`, advisory locks held across statements, and `SET` without
+   `SET LOCAL`. One thing in the current design depends on that —
+   `worker/maintenance.ts` serialises maintenance ticks with
+   `pg_try_advisory_lock`. Under a transaction pooler that must become
+   `pg_advisory_xact_lock` inside a transaction, which releases on commit. Noted so
+   the migration is a checklist rather than an investigation.
 
 ### 9.5 Prisma singleton anti-patterns
 
 | Anti-pattern | What breaks |
 |---|---|
-| `new PrismaClient()` in a module or a route handler | one pool per module instance; connection exhaustion in dev within minutes |
+| `new PrismaClient()` in a module or route handler | one pool per module instance; dev exhausts connections within minutes |
 | `$connect()` at import time | slows cold start; the adapter connects lazily on first query for a reason |
 | A client per request | ~40ms of TCP + TLS + auth per request, and 100 concurrent requests exceed `max_connections` |
-| `$disconnect()` in a route handler or after each action | kills the shared pool for every other in-flight request |
-| Passing the client around as a parameter | encourages a repo taking a client from a caller that is not a transaction; `db: Db = prisma` in §3.3.3 is for `tx` only |
-
----
+| `$disconnect()` in a route handler or after an action | kills the shared pool for every other in-flight request |
+| Passing the client as a parameter | encourages a repo taking a client from a non-transaction caller; `database: Db = db` in §3.3.3 exists for `tx` only |
 
 ## 10. Pagination
 
@@ -2150,7 +1892,7 @@ by `createdAt` is not a real workflow (searching and filtering is); and having o
 pagination mechanism for all six large tables is worth more than page numbers on
 one of them.
 
-This contradicts `03-frontend.md` §7.2 and is flagged in §17 for the lead. If the
+This contradicts `03-frontend.md` §7.2 and is flagged in §17.8 for the lead. If the
 lead rules for offset, the change is contained: `leadFilterSchema` swaps
 `cursor` for `page`, `repo.findPage` takes `skip`, and `Page<T>` grows
 `page`/`pageCount` — `service.list`'s signature does not change. The tiebreak
@@ -2191,78 +1933,80 @@ count** — it is served by
 
 ## 11. Caching and revalidation
 
+> **Ownership note.** `07-auth-and-security.md` §10.5 owns the tenancy rules for
+> caching and **bans `unstable_cache` / `"use cache"` for any tenant-scoped read**,
+> plus module-scope `Map`/object caches. This section does not soften that; it
+> states what remains cacheable and fixes the revalidation conventions per module.
+
 ### 11.1 The default is: do not cache tenant data
 
 Every `(app)/**` page reads cookies through `requireWorkspace()`, which makes the
-route dynamic. That is correct and we do not fight it. RSC still gives us
-streaming, parallel section queries, and per-`<Suspense>` boundaries — the
-performance story is "seven parallel indexed queries", not "a cache".
+route dynamic. That is correct and we do not fight it. RSC still gives streaming,
+parallel section queries, and per-`<Suspense>` boundaries — the performance story
+is "seven parallel indexed queries", not a cache.
 
-**The rule that matters, stated as an absolute:**
+`07` §10.5 and `07` §2551 rank a mis-keyed cache as the highest-severity leak
+available to us, and the reasoning is worth internalising: a cache key is derived
+from a function's *arguments*, so a helper that reads `ctx.workspaceId` from an
+enclosing scope produces **one entry that serves every tenant**. It passes every
+query-level isolation test, because the query was never re-run. It presents as a UI
+bug rather than a breach.
 
-> **A cache entry containing tenant data must have `workspaceId` in its key. No
-> exceptions. A cache key that omits it is a cross-tenant data leak, which is
-> strictly worse than a slow page.**
-
-This is why `"use cache"` and `unstable_cache` are near-banned in this codebase:
-their default key is the function's arguments plus the build id, so a helper that
-closes over `ctx` instead of taking `workspaceId` as an argument caches one
-tenant's rows under a key every tenant hits. That failure is silent, it passes
-review, and it violates brief §4.
+> **Rule: no tenant data enters a cross-request cache. Full stop.** If a future
+> need is genuine, `workspaceId` must be an explicit first argument, the entry goes
+> in the table below with its key spelled out, and the lead approves it.
 
 ### 11.2 What is cached
 
 | Data | Mechanism | Key | Lifetime |
 |---|---|---|---|
-| Static marketing, legal, pricing pages | full route cache (no cookie read) | route | build |
+| Marketing, legal, pricing pages | full route cache (no cookie read) | route | build |
 | Fonts, icons, CSS, JS | immutable asset headers | content hash | 1 year |
-| `next/font` self-hosted files | build-time | — | build |
-| `CustomFieldDefinition` list per workspace | `unstable_cache`, key `['custom-fields', workspaceId]`, tag `ws:${workspaceId}:custom-fields` | includes `workspaceId` | 300s |
-| Workspace nav badges (`getNavBadges`) | `unstable_cache`, key `['nav', workspaceId, userId]` | includes both | 60s |
+| `next/font` files | build-time | — | build |
+| `getSession()`, `requireWorkspace()` | React `cache()` | per-request by construction | one request |
 | Everything else tenant-scoped | **not cached** | — | — |
 
-Two entries, both because they are read on every page render and change rarely.
-That is the whole list. `03-frontend.md` §3.5 already proposes `unstable_cache`
-for the nav badges "keyed by workspace" — this section is the rule that makes that
-safe.
+React `cache()` is the only caching in the request path, and it is safe because its
+lifetime *is* the request (`07` §10.5). It is what makes `requireWorkspace()` free
+to call from eight server components.
 
-Note `next/cache` in Next 16 also exports `cacheTag`, `cacheLife`, `updateTag`,
-and `refresh` for the `"use cache"` directive. We do not adopt `"use cache"` for
-tenant data, for the keying reason above. If a future need is genuine, the entry
-goes in the table above with its key spelled out, and the key starts with
-`workspaceId`.
+Note this **overrules** two earlier proposals. `03-frontend.md` §3.5 suggests
+`unstable_cache` for the nav badges "for 60s keyed by workspace", and an earlier
+draft of this document proposed the same plus a `CustomFieldDefinition` cache.
+Both are banned by `07` §10.5. `03`'s own stated budget is the right answer: keep
+the badges to three indexed counts, and "if this budget is ever exceeded, the fix
+is to drop a badge, not to add caching layers." Flagged in §17.9.
+
+`next/cache` in Next 16 also exports `cacheTag`, `cacheLife`, `updateTag`, and
+`refresh` for `"use cache"`. None is used for tenant data.
 
 ### 11.3 Revalidation conventions
 
 Path revalidation is the default; tags are for data that appears on pages other
 than the one being mutated.
 
-**Naming convention for tags — always workspace-prefixed:**
+**Tag naming — always workspace-prefixed**, per `07` §10.5:
 
 ```
-ws:${workspaceId}:leads
-ws:${workspaceId}:campaigns
-ws:${workspaceId}:campaign:${campaignId}
-ws:${workspaceId}:mailboxes
-ws:${workspaceId}:inbox
-ws:${workspaceId}:custom-fields
-ws:${workspaceId}:crm
+ws:${workspaceId}:leads          ws:${workspaceId}:campaigns
+ws:${workspaceId}:campaign:${id} ws:${workspaceId}:mailboxes
+ws:${workspaceId}:inbox          ws:${workspaceId}:crm
 ```
 
-The `ws:${workspaceId}:` prefix is mandatory. An unprefixed `leads` tag
-invalidates every tenant's cache on one tenant's write — not a security hole, but
-a self-inflicted thundering herd.
+A bare `'leads'` tag invalidates across tenants. Not leaky, but it means one
+tenant's write can serve another's stale render, and on a busy instance it is a
+self-inflicted thundering herd.
 
-**Per-module revalidation table.** Server Actions declare this via
-`action({ revalidate })`; nothing else calls `revalidatePath`.
+**Per-module revalidation table.** Called from the action file (§5.3 rule 4),
+never from a service.
 
 | Module · operation | Revalidates |
 |---|---|
 | `leads.create` / `update` / `softDelete` | `/leads`, `/leads/${leadId}` |
-| `leads.bulk*` | `/leads`; `tag ws:*:leads` |
+| `leads.bulk*` | `/leads`; tag `ws:*:leads` |
 | `leads.commitImport` | `/leads`, `/leads/import/${importId}` |
 | `leads.createList` / list membership | `/leads/lists`, `/leads` |
-| `leads.suppress` | `/leads/${leadId}`, `/settings/suppressions`; `tag ws:*:leads` |
+| `leads.suppress` | `/leads/${leadId}`, `/settings/suppressions`; tag `ws:*:leads` |
 | `campaigns.create` / `update` | `/campaigns`, `/campaigns/${id}` |
 | `campaigns.launch` / `pause` / `resume` | `/campaigns`, `/campaigns/${id}`, `/dashboard` |
 | `campaigns.enroll` | `/campaigns/${id}/leads`, `/campaigns/${id}` |
@@ -2270,46 +2014,41 @@ a self-inflicted thundering herd.
 | `mailboxes.connect` / `disconnect` / `update` | `/mailboxes`, `/mailboxes/${id}`, `/dashboard` |
 | `inbox.sendReply` / `archive` / `markRead` | `/inbox`, `/inbox/${threadId}`, `/dashboard` |
 | `crm.*` | `/crm`, `/crm/opportunities/${id}`, `/leads/${leadId}` |
-| `workspace.updateSettings` | `/settings`, `/` (`layout`) |
-| `workspace.switchWorkspace` | `/` with `'layout'` — the shell must re-render |
+| `workspace.updateSettings` | `/settings`, `/` (`'layout'`) |
+| `workspace.switchWorkspace` | `/` with `'layout'` — the shell must re-render (`07` §10.4) |
 | `ai.*` | nothing (results render in a client island that refreshes itself) |
 
 Rules:
 
-1. **Revalidate the specific path, then the list.** `/leads/${id}` and `/leads`,
-   not `revalidatePath('/', 'layout')`. The nuclear option costs every user's
-   entire router cache.
-2. **Only `revalidatePath('/', 'layout')` for a workspace switch or a workspace
+1. **Revalidate the specific path, then the list.** `/leads/${id}` and `/leads`, not
+   `revalidatePath('/', 'layout')`. The nuclear option costs every user's entire
+   router cache.
+2. **`revalidatePath('/', 'layout')` only for a workspace switch or a workspace
    settings change**, because those alter the shell itself.
-3. **Worker code never revalidates.** `revalidatePath` requires a request scope
-   and there is none in the worker. Data written by a job becomes visible on the
-   user's next navigation — which is why `/leads/import/[importId]/running` polls
-   (`03` §7.4) and why the inbox has its "new messages" pill.
-4. **Revalidation runs only on success**, enforced by the wrapper's step order
-   (§5.1). Busting a cache after a failed write means re-fetching identical data.
+3. **Worker code never revalidates.** `revalidatePath` needs a request scope and the
+   worker has none. Data written by a job becomes visible on the user's next
+   navigation — which is why `/leads/import/[importId]/running` polls (`03` §7.4)
+   and the inbox has a "new messages" pill (`03` §5.10).
+4. **Revalidate only after the write commits.** Busting a cache on a failed write
+   means re-fetching identical data.
 
-### 11.4 Cross-workspace cache safety checklist
+### 11.4 Review checklist
 
-Four grep-able review items:
+Four greps, all of which must come back empty:
 
 ```bash
-# 1. No unstable_cache / "use cache" outside the two approved entries.
-grep -rn "unstable_cache\|'use cache'\|\"use cache\"" src/
+# 1. No cross-request cache of tenant data (07 §10.5 ban).
+grep -rn "unstable_cache\|'use cache'\|cacheTag(" src/
 
-# 2. Every cache key array literally contains workspaceId.
-grep -rn -A3 "unstable_cache(" src/ | grep -c "workspaceId"
+# 2. No module-scope mutable cache in a long-lived process.
+grep -rn "^const .* = new Map(\|^const cache = {" src/modules/ src/server/
 
-# 3. Every revalidateTag argument starts with the ws: prefix.
-grep -rn "revalidateTag(" src/ | grep -v "ws:\${"
+# 3. Every revalidateTag argument is workspace-prefixed.
+grep -rn "revalidateTag(" src/ | grep -v 'ws:\${'
 
 # 4. No module imports next/cache — revalidation is the caller's job (§3.1).
 grep -rn "from 'next/cache'" src/modules/
 ```
-
-Items 1 and 4 must return nothing beyond the approved entries; 2 must equal the
-count of `unstable_cache` calls; 3 must return nothing.
-
----
 
 ## 12. Idempotency
 
@@ -2370,13 +2109,16 @@ A recurring job gets its stability from a **time bucket** in the key: identical
 within a period, distinct across periods, so calling `enqueue` every 30s on a
 60s-bucket key is a no-op with no cron table and no drift.
 
-`Job.dedupeKey` is globally `@unique` and non-nullable, which means a key must
-also be reusable once the previous instance is terminal. `06` §5.3 handles this
-with `INSERT … ON CONFLICT ("dedupeKey") WHERE state IN (leasable) DO NOTHING`.
-That predicate requires a **partial** unique index, which Prisma cannot express —
-it lives in migration SQL (schema header note 4). Flagged in §17: the schema's
-plain `@@unique([dedupeKey])` and that partial-index requirement are not the same
-constraint, and the database doc owner must reconcile them.
+`Job.dedupeKey` is globally `@unique` and non-nullable — unconditionally, for the
+row's whole lifetime. `06` §0 accepts this explicitly ("There is no 'unique among
+outstanding rows' escape hatch") and resolves it by embedding a period bucket in
+every repeatable key, which is why §12's key list has `bucket60` and `YYYY-MM-DD`
+components rather than bare ids.
+
+The consequence to internalise: **a key is consumed forever, so recovery from a
+`DEAD` job is always replay-in-place, never re-enqueue.** `jobs.replay` mutates the
+existing row and increments `Job.replayCount`; enqueueing the same logical work again
+would collide. §17.4 covers the one case where this is uncomfortable.
 
 **Idempotency the API does *not* have:** no client-supplied `Idempotency-Key`
 header on route handlers. The only handler where a retry could duplicate a write
@@ -2389,29 +2131,70 @@ endpoint is not worth the machinery.
 
 ## 13. Observability
 
-`src/lib/logger.ts` is specified in `09-deployment-and-testing.md` §5.1 (fields,
-redaction deny-list, `child()`, `LOG_FORMAT=pretty` in dev) and the event
-taxonomy in §5.2. This section adds only the backend-specific parts: the per-module
-event names each service owns, and where correlation ids come from.
+`src/lib/logger.ts` is **on disk**. Its API differs from the sketch in
+`09-deployment-and-testing.md` §5.1 — the implemented shape is event-first
+positional, not a single field object:
+
+```ts
+// src/lib/logger.ts (on disk)
+export type LogContext = {
+  requestId?: string; jobId?: string; workspaceId?: string; userId?: string
+  [key: string]: unknown
+}
+
+export const logger = {
+  debug(event: string, ctx?: LogContext): void
+  info (event: string, ctx?: LogContext): void
+  warn (event: string, ctx?: LogContext): void
+  /** The throwable is a separate parameter so the stack is captured, not stringified. */
+  error(event: string, error?: unknown, ctx?: LogContext): void
+  child(base: LogContext): { debug; info; warn; error }
+}
+```
+
+So a service writes `logger.info('lead.created', { workspaceId, leadId })` and a
+failure writes `logger.error('mailbox.sync.failed', err, { mailboxId })` — not
+`log.info({ event: … })`. Redaction is a key-name deny-list applied at up to four
+levels of depth, and it already covers `body`, `html`, `htmlBody`, `textBody`, so an
+email body passed as one of those keys is redacted automatically. It is **not**
+covered if you interpolate it into the event name or a differently-named field.
+
+The event taxonomy is `09` §5.2. This section adds the backend-specific parts:
+per-module event ownership, and where correlation ids come from.
 
 ### 13.1 Correlation
 
 | Process | Id | Source |
 |---|---|---|
-| web request / action | `requestId` | `x-request-id` inbound header, else `crypto.randomUUID()`; carried in `Ctx.requestId` and in `AsyncLocalStorage` (`src/server/request-context.ts`) |
-| job attempt | `jobId` | `Job.id`; `log.child({ jobId, jobType, attempt })` per attempt |
-| link between them | — | see §17: `09` §5.1 specifies a `Job.enqueuedByRequestId` column that does not exist in `prisma/schema.prisma` |
+| web request / action | `requestId` | `x-request-id` inbound header, else `crypto.randomUUID()`; held in `AsyncLocalStorage` (`src/server/request-context.ts`, per `09` §5.1) |
+| job attempt | `jobId` | `Job.id`; `logger.child({ jobId, jobType, attempt })` per attempt |
+| link between them | — | see §17.6: `09` §5.1 specifies a `Job.enqueuedByRequestId` column that does not exist in the schema |
 
-Until that column exists, a send is traceable to its click through
+Note `Ctx` as `07` §9.1 defines it carries **no `requestId`** — it holds `userId`,
+`workspaceId`, `role`, `sessionId`, `timezone`. So a service that wants the
+correlation id reads it from `request-context.ts`, not from its `Ctx` parameter, and
+in the worker there is no request context at all — the job's `logger.child` is
+passed down explicitly. Do not add `requestId` to `Ctx` to avoid this: `Ctx` is the
+tenancy carrier and widening it invites widening it again.
+
+Until `enqueuedByRequestId` exists, a send is traceable to its click through
 `Job.payload.scheduledEmailId` → `ScheduledEmail.id`, which appears in the action
 log line. Workable, one hop longer.
 
 ### 13.2 Per-module event names
 
-Dotted `domain.subject.verb`, past tense, **stable** — dashboards key on these
-strings, so a rename is a breaking change. The list below extends `09` §5.2 with
-the events that section does not cover, in the same style. Each module owns its
-prefix and no other module emits it.
+Dotted `domain.subject.verb`, **stable** — dashboards and alerts key on these
+strings, so a rename is a breaking change. Each module owns its prefix and no other
+module emits it.
+
+**Ownership, and why the table below has holes.** `09` §5.2 owns the cross-cutting
+taxonomy, and `06` §13 owns the `job.*`, `send.*`, `cap.*`, `window.*`, and
+`enrollment.*` names — with concrete spellings that differ from an earlier draft of
+this section (`job.dead` not `job.dead_lettered`, `job.retry` not `job.failed`,
+`send.accepted` not `send.succeeded`, `send.blocked` / `send.deferred` /
+`send.unknown_outcome` / `send.reconciled`). **Those two docs win**; the rows below
+for `jobs` and `sending` point at them rather than restating a competing list, since
+two spellings for one event is worse than one imperfect spelling.
 
 | Module | Events it owns |
 |---|---|
@@ -2420,8 +2203,8 @@ prefix and no other module emits it.
 | `mailboxes` | `mailbox.oauth.started` · `mailbox.oauth.callback_failed{reason}` · `mailbox.connected` · `mailbox.disconnected{reason}` · `mailbox.token.refreshed` · `mailbox.token.refresh_failed{status}` · `mailbox.sync.started` · `mailbox.sync.completed{messages,durationMs}` · `mailbox.sync.failed{reason}` · `mailbox.cursor.expired` · `mailbox.watch.renewed` · `mailbox.watch.expired` · `mailbox.throttled{until}` |
 | `leads` | `lead.created{source}` · `lead.updated` · `lead.deleted{count}` · `lead.imported{rows,accepted,rejected}` · `lead.import.rejected_row{rowNumber,reason}` · `lead.unsubscribed{source}` · `lead.suppressed{reason,scope}` · `lead.bulk.queued{operation,affected}` · `lead.export.streamed{rows}` |
 | `sequences` | `sequence.step.created{type,position}` · `sequence.step.updated` · `sequence.step.deleted` · `sequence.reordered` · `sequence.version.bumped{from,to}` · `sequence.variant.added{label}` · `sequence.render.failed{missingToken}` |
-| `campaigns` | `campaign.created` · `campaign.launched` · `campaign.paused{by}` · `campaign.resumed` · `campaign.completed` · `campaign.archived` · `campaign.enrolled{leads,skipped,suppressed}` · `campaign.enroll.skipped{reason}` · `campaign.tick.completed{advanced,materialised,durationMs}` · `campaign.advance.blocked{reason}` |
-| `sending` | `send.attempted` · `send.succeeded{providerMessageId}` · `send.failed{providerStatus,classification}` · `send.suppressed{reason}` · `send.deferred{reason:'window'\|'daily_cap'\|'pacing'\|'throttled'}` · `send.claim.lost` · `send.reconcile.started` · `send.reconcile.verdict{verdict}` · `provider.rate_limited{provider,retryAfterMs}` · `provider.quota_exhausted{provider}` |
+| `campaigns` | `campaign.created` · `campaign.launched` · `campaign.resumed` · `campaign.completed` · `campaign.archived` · `campaign.enrolled{leads,skipped,suppressed}` · `campaign.enroll.skipped{reason}` · `campaign.tick.completed{advanced,materialised,durationMs}` — plus `campaign.paused{actor,cancelledRows,cancelledJobs}` and `enrollment.stopped{stopReason,atPosition}`, both owned by `06` §13 |
+| `sending` | **owned by `06` §13**: `send.claimed` · `send.blocked{stopReason}` · `send.deferred{reason}` · `send.accepted{providerMessageId}` · `send.failed{errorClass,providerStatus,permanent}` · `send.unknown_outcome` **pages** · `send.reconciled{verdict}` · `send.duplicate_detected` **pages** · `cap.reserved` / `cap.exhausted` · `mailbox.throttled_by_provider` |
 | `inbox` | `inbox.thread.created` · `inbox.message.stored{direction}` · `inbox.reply.sent` · `inbox.thread.archived` · `inbox.search.completed{durationMs,results}` |
 | `replies` | `reply.detected{kind}` · `reply.attributed{campaignLeadId}` · `reply.unattributed{reason}` · `reply.sequence_stopped{stepsCancelled}` · `bounce.recorded{kind}` · `bounce.suppressed{email}` · `webhook.received{provider}` · `webhook.unmatched{providerEventId}` |
 | `analytics` | `analytics.event.recorded{type}` · `analytics.event.deduped{dedupeKey}` · `analytics.rollup.completed{workspaceId,day,durationMs}` · `analytics.counter.drift_detected{table,column,delta}` · `analytics.open.bot_filtered` |
@@ -2429,21 +2212,27 @@ prefix and no other module emits it.
 | `crm` | `crm.opportunity.created{stage}` · `crm.opportunity.stage_changed{from,to}` · `crm.opportunity.won{value,currency}` · `crm.opportunity.lost{reason}` · `crm.task.created` · `crm.task.completed` · `crm.note.added` |
 | `deliverability` | `dns.checked{domain,spf,dkim,dmarc,mx}` · `dns.lookup_failed{domain,error}` · `deliverability.score.updated{mailboxId,score}` |
 | `warmup` | `warmup.ramp.advanced{mailboxId,day,target}` · `warmup.send.queued` · `warmup.paused{reason}` |
-| `jobs` | `job.enqueued{type,runAt,dedupeKey}` · `job.duplicate_suppressed{dedupeKey}` · `job.leased{type,attempt}` · `job.succeeded{type,durationMs}` · `job.failed{type,attempt,willRetryAt}` · `job.dead_lettered{type,attempts}` **error** · `job.lease_expired{type}` · `job.lease_lost{jobId}` · `job.replayed{by}` |
+| `jobs` | **owned by `06` §13**: `job.leased{attempt,priority}` · `job.succeeded{durationMs}` · `job.deferred{reason,untilMs}` · `job.retry{attempt,maxAttempts,errorClass}` · `job.dead{attempt,errorClass}` **error** · `job.lease_lost` **error** · `job.lease_reclaimed{count}` · `job.replayed{actor,replayCount}` · plus `worker.*` |
 | `src/server/` | `action.invoked{name}` · `action.rejected{name,code}` · `http.request.completed{method,path,status,durationMs}` · `ratelimit.exceeded{key,limit}` |
 
-Levels: `debug` per-item detail · `info` facts · `warn`
-handled-but-notable (`send.deferred`, `provider.rate_limited`,
-`authz.cross_workspace_attempt`, every `action.rejected` with an expected code) ·
-`error` a human should look (`job.dead_lettered`, `mailbox.sync.failed`,
-`ai.output_invalid`, `analytics.counter.drift_detected`, any unexpected throw).
+Levels: `debug` per-item detail · `info` facts (including `send.deferred` and
+`job.deferred` — a closed sending window is normal, not a problem) · `warn`
+handled-but-notable (`job.retry`, `authz.denied`, `authz.cross_workspace_attempt`,
+`provider.rate_limited`, every `action.rejected` carrying an `AppError`) · `error` a
+human should look (`job.dead`, `send.unknown_outcome`, `mailbox.sync.failed`,
+`ai.output_invalid`, `analytics.counter.drift_detected`, and every throw that is not
+an `AppError`).
+
+The `isAppError(e)` test in §6.1 is exactly the warn/error boundary: a modelled
+outcome is `warn`, an unmodelled one is a bug and is `error`.
 
 ### 13.3 Logging rules specific to services
 
 1. **A service logs facts; it does not log its own throws.** The `action()` /
-   `jsonRoute()` wrapper logs the rejection once, with the code and the stack.
-   A service that also logs produces two lines for one failure and doubles the
-   noise on every dashboard.
+   route wrapper logs the rejection once, with the code and the stack. A service
+   that also logs produces two lines for one failure and doubles the noise on every
+   dashboard. `requireCan` already emits `authz.denied` itself (see
+   `src/server/authz.ts`), so a service must not log a denial on top of it.
 2. **`workspaceId` on every line inside a request or job.** It comes free from
    `ctx`; a line without it cannot be filtered per tenant during an incident.
 3. **Never log an email body, a subject line, a refresh token, or a session
@@ -2458,131 +2247,110 @@ handled-but-notable (`send.deferred`, `provider.rate_limited`,
 
 ## 14. Rate limiting
 
-### 14.1 Placement
+> **Ownership note.** `07-auth-and-security.md` §14 owns the limiter: the
+> `RateLimit` model, the single-statement upsert, `consume()`, the fixed-window
+> choice, fail-open behaviour, and every auth limit. This section states only
+> where limiting sits relative to modules, and the limits for the surfaces `07`
+> does not cover.
+
+### 14.1 The limiter, as `07` §14 fixes it
+
+```ts
+// src/lib/rate-limit.ts — owned by 07-auth-and-security.md §14.2
+export type RateLimitRule = { bucket: string; limit: number; windowMs: number }
+export type RateLimitResult =
+  | { ok: true; remaining: number }
+  | { ok: false; retryAfterSeconds: number; limit: number; resetAt: Date }
+
+/** `identity` is already-composed, e.g. `ip:203.0.113.7` or `user:cuid`. */
+export async function consume(rule: RateLimitRule, identity: string): Promise<RateLimitResult>
+```
+
+The window is **in the primary key**
+(`"<bucket>:<identity>:<windowStartEpochSeconds>"`), which is what makes the whole
+limiter one atomic upsert with no read-modify-write. Fixed window, accepted 2×
+boundary burst, fail-open on limiter error. `MAINTENANCE` deletes closed windows.
+
+### 14.2 Placement
 
 ```
-                            ┌── login, register, password reset  → IP + email
-   Server Action ──────────▶│   invite send                       → workspace
-   (action() step 4)        │   CSV import start                  → workspace
-                            │   AI generate / regenerate          → workspace + user
+                            ┌── login, register, password reset  → IP + email   (07 §14)
+   Server Action ──────────▶│   invite send                       → workspace    (07 §14)
+   action() step 2          │   CSV import commit                 → workspace
+                            │   AI generate / regenerate          → workspace + message
                             └── bulk ops                          → workspace
 
                             ┌── /api/oauth/google/start           → user
    Route handler ──────────▶│   /api/leads/import                 → workspace
-   (jsonRoute, before body) │   /api/worker/tick                  → token identity
+   before reading the body  │   /api/leads/export                 → workspace
                             └── /api/track/*, /api/unsubscribe/*  → IP, generous
 
-   Job handler ────────────▶  NOT rate limited. Bounded by concurrency, per-mailbox
-                              pacing (minSecondsBetweenSends + sendJitterSeconds),
-                              and daily caps (MailboxDailyStat). Those are pacing,
-                              not rate limiting, and they live in modules/sending.
+   Job handler ────────────▶  NOT rate limited. Bounded by worker concurrency,
+                              per-mailbox pacing (minSecondsBetweenSends +
+                              sendJitterSeconds), and daily caps
+                              (MailboxDailyStat). That is pacing, not rate
+                              limiting, and it lives in modules/sending.
 ```
 
-Rate limiting sits at **the trust boundary, inside the wrapper** — never in a
-service. A service called from the worker must not consume a user's HTTP budget,
-and a service called twice inside one action must not count twice.
+**Rate limiting sits at the trust boundary, inside the wrapper — never in a
+service.** Two reasons, both structural: a service called from the worker must not
+consume a user's HTTP budget, and a service called twice within one action must not
+count twice. A `rateLimit` rule is therefore a property of an *action or route*, not
+of a domain operation.
 
-### 14.2 Implementation
+It sits **before** parsing (`07` §13.1 step 2) so a flood of malformed payloads
+cannot burn CPU on zod, which also means a rule's `identity` cannot reference a
+validated input field. Compose identity from `ctx` and route params only.
 
-```ts
-// src/lib/rate-limit.ts
-import 'server-only'
-import { RateLimitedError } from './errors'
+### 14.3 The non-auth limits
 
-/**
- * Fixed-window counter in Postgres. Deliberately boring.
- *
- * Not Redis: brief §2 rejects it, and the whole point of one datastore is that
- * this needs no second one.
- * Not in-memory: three web replicas would give a 3× effective limit, and a
- * restart would reset every window — which is exactly the wrong behaviour for
- * login throttling.
- * Not a sliding window / token bucket: a fixed window admits at most 2× the
- * limit across a boundary, which for "5 login attempts a minute" is irrelevant,
- * and the simpler thing is the thing that stays correct.
- */
-export async function consumeRateLimit(
-  key: string,
-  limit: number,
-  windowMs: number,
-): Promise<void>
-```
+`07` §14.3–14.4 set the auth limits (login, register, reset, invite). These are the
+rest, all keyed by workspace or user because every caller is authenticated:
 
-One statement, atomic, no read-then-write race:
-
-```sql
--- The window start is derived, so there is no cleanup job for expired windows:
--- a new window is a different primary key, and MAINTENANCE prunes old rows.
-INSERT INTO "RateLimit" ("key", "windowStart", "count")
-VALUES ($key, to_timestamp(floor(extract(epoch from now()) / $windowSec) * $windowSec), 1)
-ON CONFLICT ("key", "windowStart")
-DO UPDATE SET "count" = "RateLimit"."count" + 1
-RETURNING "count";
--- count > limit  ⇒  throw RateLimitedError(retryAfterMs = window end − now)
-```
-
-**This requires a `RateLimit` table that does not exist in
-`prisma/schema.prisma`.** Flagged in §17 — it is the one new table this document
-needs.
-
-```prisma
-/// Fixed-window rate limit counter. Not tenant-owned: the key namespaces itself
-/// ("login:ip:1.2.3.4", "ws:<id>:leads.import"), and login limiting happens
-/// before any workspace is known.
-model RateLimit {
-  key         String
-  windowStart DateTime @db.Timestamptz(6)
-  count       Int      @default(0)
-  @@id([key, windowStart])
-  @@index([windowStart])          // MAINTENANCE prunes windowStart < now() - 1 day
-}
-```
-
-### 14.3 The limits
-
-| Surface | Key | Limit | Window | Rationale |
+| Surface | bucket · identity | limit | window | Rationale |
 |---|---|---|---|---|
-| `auth.login` | `login:ip:${ip}` | 20 | 5 min | slows spraying across accounts |
-| `auth.login` | `login:email:${sha256(email)}` | 5 | 5 min | per-account; pairs with `User.failedLoginCount` / `lockedUntil` |
-| `auth.register` | `register:ip:${ip}` | 5 | 1 h | signup abuse |
-| `auth.requestPasswordReset` | `pwreset:email:${sha256(email)}` | 3 | 1 h | email bombing a third party |
-| `workspace.invite` | `invite:ws:${workspaceId}` | 20 | 1 h | we send those emails; abuse is our reputation |
-| `/api/leads/import` | `import:ws:${workspaceId}` | 5 | 1 h | each is up to 50k rows |
-| `leads.bulk*` | `bulk:ws:${workspaceId}` | 30 | 1 h | each may enqueue thousands of jobs |
-| `/api/oauth/google/start` | `oauth:user:${userId}` | 10 | 10 min | state-token flooding |
-| `ai.*` generate | `ai:ws:${workspaceId}` | 100 | 1 h | real money; `modules/ai/budget.ts` also enforces spend |
-| `ai.regenerate` | `ai:msg:${messageId}` | 5 | 1 h | matches `08` §2210 |
-| `leads.create` | `leads.create:ws:${workspaceId}` | 120 | 1 min | a sane ceiling, not a real constraint |
-| `/api/track/*` | `track:ip:${ip}` | 600 | 1 min | generous: one recipient's mail client may fetch many pixels |
+| `POST /api/leads/import` | `leads.import` · `ws:<id>` | 5 | 1 h | each is up to 50k rows |
+| `GET /api/leads/export` | `leads.export` · `ws:<id>` | 5 | 1 h | matches `07` §7's `export:workspace → 5/hour`; one export is the whole commercial asset |
+| `leads.bulk*` | `leads.bulk` · `ws:<id>` | 30 | 1 h | each may enqueue thousands of jobs |
+| `leads.create` | `leads.create` · `ws:<id>` | 120 | 1 min | a sane ceiling, not a real constraint |
+| `POST /api/oauth/google/start` | `oauth.start` · `user:<id>` | 10 | 10 min | signed-state flooding |
+| `ai.*` generate | `ai.generate` · `ws:<id>` | 100 | 1 h | real money; `modules/ai/budget.ts` also enforces spend |
+| `ai.regenerate` | `ai.regenerate` · `msg:<id>` | 5 | 1 h | matches `08` §2210 |
+| `campaigns.launch` | `campaigns.launch` · `ws:<id>` | 20 | 1 h | launch is cheap but audit-logged and irreversible in effect |
+| `GET /api/track/*` | `track` · `ip:<addr>` | 600 | 1 min | generous: one recipient's client may fetch many pixels |
+
+Two are per-resource rather than per-workspace (`ai.regenerate` on a message,
+`oauth.start` on a user) because the abuse they prevent is per-resource; using a
+workspace key there would let one user exhaust a colleague's budget.
 
 ### 14.4 What rate limiting is not for
 
-**Gmail's quotas are not rate limiting; they are pacing, and they are not ours to
-enforce by counting.** Gmail's real limits are a *rolling* window — roughly 2,000
-messages/day for Workspace and 500 for consumer accounts, plus undocumented
-per-minute and per-recipient throttles — enforced server-side and exposed by no
-API. Our `EmailAccount.dailySendLimit` default of **50** is therefore a courtesy
-limit set far below Gmail's, chosen for deliverability rather than to avoid a 429.
+**Gmail's quotas are not rate limiting, and they are not ours to enforce by
+counting.** Gmail's real limits are a *rolling* window — roughly 2,000 messages/day
+for Workspace and 500 for consumer accounts, plus undocumented per-minute and
+per-recipient throttles — enforced server-side and exposed by no API. Our
+`EmailAccount.dailySendLimit` default of **50** is a courtesy limit set far below
+Gmail's, chosen for deliverability rather than to dodge a 429.
 
 Consequences already in the schema and design:
 
-- `EmailAccount.minSecondsBetweenSends` (90) and `sendJitterSeconds` (120) exist
-  so a mailbox does not emit a machine-regular burst.
-- `MailboxDailyStat` per local day exists so the cap check is one indexed read
-  inside the claim transaction, not a `COUNT` over `ScheduledEmail`.
-- A `quotaExceeded` from Gmail is treated as **authoritative and terminal for that
-  mailbox for the rest of the day** — `EmailAccount.status = THROTTLED` with
-  `throttledUntil`, and the scheduler skips it (that is what
-  `@@index([status, throttledUntil])` is for). We do not retry into a quota wall;
-  retrying makes reputation worse.
-- Timezone/DST bites here: "today" for a cap is the mailbox's local date
-  (`MailboxDailyStat.localDate`, derived from `EmailAccount.timezone`), and a
-  spring-forward day is 23 hours of wall clock but still one calendar date. That
-  is the behaviour operators expect and it is why the schema stores an IANA zone
-  string rather than a fixed offset. Window arithmetic lives in
-  `modules/sending/windows.ts` and is unit-tested against both DST transitions.
-
----
+- `EmailAccount.minSecondsBetweenSends` (90) and `sendJitterSeconds` (120) exist so a
+  mailbox does not emit a machine-regular burst. `06` §16.1 notes these cannot be
+  enforced under concurrency without a `nextSendAt` column — see §17.11.
+- `MailboxDailyStat` per local day exists so the cap check is one indexed read inside
+  the claim, not a `COUNT` over `ScheduledEmail`.
+- A `quotaExceeded` from Gmail is **authoritative and terminal for that mailbox for
+  the rest of the day**: `EmailAccount.status = THROTTLED` with `throttledUntil`, and
+  the scheduler skips it (that is what `@@index([status, throttledUntil])` is for).
+  We do not retry into a quota wall; retrying makes reputation worse.
+- **Timezone and DST bite here.** "Today" for a cap is the mailbox's local date
+  (`MailboxDailyStat.localDate`, derived from `EmailAccount.timezone`). A
+  spring-forward day is 23 hours of wall clock but still one calendar date, and a
+  fall-back day is 25 — which is the behaviour operators expect, and why the schema
+  stores an IANA zone string rather than a fixed offset. A stored offset would be
+  wrong twice a year in a way nobody notices until a send lands at 03:00. Window
+  arithmetic lives in `modules/sending/windows.ts` and is unit-tested against both
+  transitions.
 
 ## 15. The worker's contract with modules
 
@@ -2623,12 +2391,12 @@ Five rules:
    without consuming an attempt. Treating a closed sending window as a failure
    burns five retries and dead-letters a perfectly healthy send by 09:00.
 
-`JobType` naming is the one place the two docs diverge on vocabulary: the schema's
-`JobType` enum is `SCREAMING_SNAKE` (`SEND_SCHEDULED_EMAIL`, `SCHEDULER_TICK`,
-`PROCESS_INBOUND_MESSAGE`), while `06` §5.1 declares a dotted string union
-(`'email.send'`, `'campaign.tick'`, `'reply.process'`). **This document uses the
-schema's enum**, because the column is `type JobType` and a Prisma enum is not a
-free-form string. Flagged in §17.
+`JobType` values are the schema's `SCREAMING_SNAKE` enum members
+(`SEND_SCHEDULED_EMAIL`, `SCHEDULER_TICK`, `PROCESS_INBOUND_MESSAGE`, …), not dotted
+strings — `Job.type` is a Prisma enum column, so a free-form string is not storable.
+An earlier draft of `06` used a dotted union; its §0 has since adopted the enum, so
+the two documents agree and there is nothing here for the lead to resolve. The one
+value `06` needs and the enum lacks is `RECONCILE_SEND` (§17.11).
 
 ---
 
@@ -2877,25 +2645,40 @@ Mailbox credentials and destructive bulk operations are where the line sits, and
 
 ## 17. Conflicts the lead engineer must resolve
 
-Every item was found by grepping `prisma/schema.prisma` or a sibling doc as of
-**2026-08-31**, not by inspection of prose. Sibling docs are being revised
-concurrently; `06-jobs-and-sending-engine.md` in particular added a §0
-("Conformance to the committed schema") during this document's drafting and now
-follows the schema's `Job.state` / `attempt` / `dedupeKey` / `priority DESC`
-naming. Items below are what remained after that pass.
+Every item was grepped against `prisma/schema.prisma` or a sibling doc as of
+**2026-08-31**, not inferred from prose. Sibling docs were being revised
+concurrently with this one, so two things already resolved themselves and are
+recorded here only so nobody re-raises them:
 
-### 17.1 `RateLimit` table does not exist — blocking
+- `06-jobs-and-sending-engine.md` added a §0 ("Conformance to the committed
+  schema") and now follows the schema's `Job.state` / `attempt` / `dedupeKey` /
+  `priority DESC` naming throughout.
+- `07-auth-and-security.md` §21 independently enumerates the auth-side schema gaps.
+  Where it and this section overlap, **`07` is the owner** and this section defers
+  rather than restating — a gap listed twice with two different recommendations is
+  worse than one listed once.
 
-§14.2 requires it. Brief §6 mandates rate limiting on login, invite, CSV import,
-AI calls, and OAuth start. Grep: zero occurrences of a `RateLimit` model in the
-schema, and no alternative store exists (brief §2 rejects Redis).
+What follows is what remained after both passes.
 
-**Recommendation: add the two-column model in §14.2** (`@@id([key, windowStart])`,
-`@@index([windowStart])`). It is deliberately **not** tenant-owned — login
-limiting happens before any workspace is known — which makes it a **third** model
-with no `workspaceId`, alongside `AuditLog` and `WebhookEvent`. The schema header
-comment enumerating those exceptions, and `01-database.md` §3, both need updating.
-Without this table, phase 1 cannot satisfy brief §6.
+### 17.1 `RateLimit` table does not exist — blocking, owned by `07` §21.1
+
+§14 of this document and `07` §14.1 both require it; brief §6 mandates the
+limiting it implements. Grep: no such model in the schema, and Redis is rejected by
+brief §2.
+
+**`07` §21.1 owns this item and its model definition** (`key` as the primary key
+with the window embedded, `count`, `expiresAt`, `@@index([expiresAt])`). Recorded
+here only because §14.2's placement rules are unimplementable without it, and
+because it has one consequence in this document's territory: `MAINTENANCE` gains a
+`DELETE FROM "RateLimit" WHERE "expiresAt" < now()` sweep, which is the seventh
+cross-workspace function in §4.4's enumerated list — except it touches no tenant
+data at all, so it needs no `*AcrossWorkspaces` suffix.
+
+Note the earlier draft of this document proposed a two-column composite key
+(`@@id([key, windowStart])`). **`07`'s single-column form is better** and is the one
+to build: putting the window *inside* the key string makes the limiter one upsert
+against a primary key with no composite-key handling, and makes the sweep a single
+indexed range delete.
 
 ### 17.2 `WorkerHeartbeat` table does not exist — blocking for phase 6
 
@@ -2922,33 +2705,31 @@ the latest attempt. Grep: zero occurrences in the schema.
 and rewrite `06` §6.4 to decide from `ScheduledEmail` alone. The first is a small
 table; the second weakens the one guarantee the product cannot get wrong.
 
-### 17.4 `Job.dedupeKey`: unconditional unique makes coalescing jobs single-use
+### 17.4 `Job.dedupeKey`: one consequence of the unconditional unique — not blocking
 
-Schema: `@@unique([dedupeKey])`, globally and unconditionally, and `06` §0 accepts
-this explicitly ("There is no 'unique among outstanding rows' escape hatch"),
-resolving it by embedding a period bucket in every repeatable key.
+Schema: `@@unique([dedupeKey])`, globally and for the row's whole lifetime. `06` §0
+accepts this explicitly ("There is no 'unique among outstanding rows' escape hatch")
+and designs around it: every repeatable key embeds a period bucket, and `06` §7.3's
+`replay` **resets the original row in place** (`UPDATE … SET state='PENDING',
+attempt=0, replayCount=replayCount+1 WHERE state='DEAD'`) rather than cloning it,
+"because `dedupeKey` is globally unique and a clone would collide".
 
-That resolution works for time-driven jobs but leaves one case unresolved.
-`06` §603 gives `MAILBOX_SYNC` the key
-`MAILBOX_SYNC:{emailAccountId}:{historyId ?? bucketMinute}` and describes the
-coalescing as intentional. When `historyId` is present the key is single-use *per
-history id*, which is correct. When it is absent it falls back to a minute
-bucket — so two pushes for the same mailbox in one minute coalesce, which is
-desired, but a push in minute N+1 for the *same unchanged* historyId enqueues a
-second job. Tolerable.
+That resolution is coherent and this document follows it. The residual sharp edge,
+recorded so it is a known limit rather than a surprise: **for a key with no time
+bucket, the work can never be enqueued a second time.** `MAILBOX_SYNC:{id}:{historyId}`
+is the case — once that row exists, only replay-in-place can re-run it, and if the row
+has been pruned (`MAINTENANCE` deletes terminal jobs after 30 days) the key is
+unreachable and a re-sync of that history id is impossible. In practice Gmail expires a
+`historyId` in about a week, well before the prune, so the window where this matters is
+empty. Stated because "it works because two retention periods happen to be ordered
+correctly" is worth writing down.
 
-The genuinely unresolved case is a **retry after terminal failure**: once a
-`MAILBOX_SYNC:{id}:{historyId}` job reaches `DEAD`, that key is consumed forever
-and the same history id can never be re-synced, even by an operator replay.
-`06` §1036 relies on `Job.replayCount` for replay, which mutates the existing row
-rather than inserting — so replay works, but *re-enqueue* does not.
-
-**Recommendation: keep the unconditional unique** (it is simpler and `06` has
-already designed around it) **and document that recovery from a `DEAD` job is
-always replay-in-place, never re-enqueue.** If a future job type genuinely needs
-key reuse, switch to a partial unique index in migration SQL
-(`WHERE state IN ('PENDING','RUNNING','RETRYING')`, per schema header note 4),
-remembering that `ON CONFLICT`'s target predicate must textually match the index.
+**Recommendation: keep the unconditional unique** — it is simpler, `06` has designed
+around it, and a partial unique index would need `ON CONFLICT`'s predicate to match
+the index text exactly, which is a footgun in migration SQL. Document the rule as
+"recovery from `DEAD` is replay, never re-enqueue." If a future job type genuinely
+needs key reuse after a terminal state, that is when to switch to a partial index
+(`WHERE state IN ('PENDING','RUNNING','RETRYING')`, per schema header note 4).
 
 ### 17.5 `09-deployment-and-testing.md` still uses pre-schema names
 
@@ -2963,13 +2744,16 @@ current grep counts in `09`:
 | `Job.idempotencyKey` | 6 | `Job.dedupeKey` |
 | `Job.leasedBy` | 2 | `Job.lockedBy` |
 | `Mailbox` + `status='CONNECTED'`, `disconnectedAt`, `disconnectReason` | 1 / 1 / 3 / 2 | `EmailAccount`; `EmailAccountStatus` = `CONNECTING · ACTIVE · PAUSED · DISCONNECTED · THROTTLED · ERROR` |
-| `MailboxCredential.keyVersion` | 4 | `EmailAccount.encryptedRefreshToken` + `encryptionKeyVersion` |
 | `EmailEvent.bounceKind`, `.mailboxId` | 2 / 8 | bounce detail lives on `EmailMessage.bounceType`/`bounceCode`; the event FK is `emailAccountId` |
 | `Lead.importBatchId` | 2 | `Lead.leadImportId` |
 
 Every one of these appears inside runnable SQL — the six §5.4 metrics queries and
 the §3.5 restore-verification script — so all of it fails on contact with the real
 database. **Recommendation: mechanical rename pass over `09`, schema wins.**
+
+`09`'s `MailboxCredential.keyVersion` (4 occurrences) is the same class of drift but
+is **already owned by `07` §21.3**, which resolves it in the schema's favour and
+lists the two concrete consequences. Not restated here.
 
 ### 17.6 `Job.enqueuedByRequestId` does not exist
 
@@ -3017,7 +2801,26 @@ select-all-matching already ships a filter descriptor rather than ids. If the le
 rules for offset, the change is contained to `leadFilterSchema`, `repo.findPage`,
 and `Page<T>`; `service.list`'s signature is unaffected either way.
 
-### 17.9 Two module-surface additions
+### 17.9 `03-frontend.md` §3.5's nav-badge cache is banned by `07` §10.5
+
+`03` §3.5 specifies caching the nav badges / sending meter with `unstable_cache`
+"for 60s keyed by workspace". `07` §10.5 bans `unstable_cache` and `"use cache"`
+outright for any tenant-scoped read, and `07` §20 item 6 ranks a mis-keyed cache as
+the highest-severity leak available to us — it defeats every query-level isolation
+test because the query never re-runs.
+
+The two are not reconcilable by being careful: the ban is categorical precisely
+because "keyed by workspace" is easy to say and easy to get wrong (a closure over
+`ctx.workspaceId` produces one entry serving every tenant, and it looks correct).
+
+**Recommendation: uphold `07`'s ban and drop the cache.** `03` §3.5's own budget is
+the right answer and it says so: keep the badges to three indexed counts, and "if
+this budget is ever exceeded, the fix is to drop a badge, not to add caching
+layers." §11.2 of this document is written to the ban. An earlier draft of this
+section proposed the same cache plus a `CustomFieldDefinition` one; both are
+withdrawn.
+
+### 17.10 Two module-surface additions
 
 From §2.5, repeated so the lead sees them in one list:
 
@@ -3027,7 +2830,7 @@ From §2.5, repeated so the lead sees them in one list:
 - **`suppressions` is not a module.** `03` §2's `suppressions.describeToken` maps
   to `leads.describeSuppressionToken`; `Suppression` is a leads-domain table.
 
-### 17.10 Open requests from `06` that this document depends on
+### 17.11 Open requests from `06` that this document depends on
 
 Listed for visibility because §8 and §14 assume they resolve in `06`'s favour;
 they are `06`'s to argue and the lead's to decide.
@@ -3044,7 +2847,7 @@ they are `06`'s to argue and the lead's to decide.
 - **`JobType.RECONCILE_SEND`** (`06` §16.4) — currently a `MAINTENANCE` subtype,
   which buries a correctness path in housekeeping and makes it unalertable.
 
-### 17.11 One thing that is settled and must not be re-litigated
+### 17.12 One thing that is settled and must not be re-litigated
 
 `prisma/schema.prisma`'s `datasource` block carries **`provider` only**. No `url`,
 no `directUrl`. Migrate reads `datasource.url` from `prisma.config.ts`;
