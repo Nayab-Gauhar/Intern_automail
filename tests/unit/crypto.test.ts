@@ -9,15 +9,13 @@ import { describe, expect, test, beforeAll } from 'bun:test'
  * validates at module load.
  */
 
+const ALGO = 'aes-256-gcm'
 const CURRENT_KEY = Buffer.alloc(32, 1).toString('base64')
 const PREVIOUS_KEY = Buffer.alloc(32, 2).toString('base64')
 
 let encrypt: (s: string) => string
 let decrypt: (s: string) => string
 let needsRotation: (s: string) => boolean
-let hashToken: (s: string) => string
-let generateToken: (n?: number) => string
-let safeEqual: (a: string, b: string) => boolean
 
 beforeAll(async () => {
   // NODE_ENV is typed readonly, so assign through the record index.
@@ -30,7 +28,7 @@ beforeAll(async () => {
   process.env.WORKER_AUTH_TOKEN = 'y'.repeat(16)
 
   const mod = await import('../../src/lib/crypto')
-  ;({ encrypt, decrypt, needsRotation, hashToken, generateToken, safeEqual } = mod)
+  ;({ encrypt, decrypt, needsRotation } = mod)
 })
 
 describe('encrypt / decrypt round trip', () => {
@@ -142,67 +140,5 @@ describe('key rotation', () => {
 
     expect(decrypt(legacy)).toBe('legacy-secret')
     expect(needsRotation(legacy)).toBe(true)
-  })
-})
-
-const ALGO = 'aes-256-gcm'
-
-describe('hashToken', () => {
-  test('is deterministic', () => {
-    expect(hashToken('abc')).toBe(hashToken('abc'))
-  })
-
-  test('differs for different inputs', () => {
-    expect(hashToken('abc')).not.toBe(hashToken('abd'))
-  })
-
-  test('does not contain the input', () => {
-    expect(hashToken('session-token-value')).not.toContain('session-token-value')
-  })
-
-  test('is url-safe and fixed length', () => {
-    const h = hashToken(generateToken())
-    expect(h).toMatch(/^[\w-]+$/)
-    expect(h).toHaveLength(43) // 32 bytes, base64url, unpadded
-  })
-})
-
-describe('generateToken', () => {
-  test('is url-safe', () => {
-    expect(generateToken()).toMatch(/^[\w-]+$/)
-  })
-
-  test('yields 256 bits by default', () => {
-    expect(Buffer.from(generateToken(), 'base64url')).toHaveLength(32)
-  })
-
-  test('respects an explicit byte length', () => {
-    expect(Buffer.from(generateToken(16), 'base64url')).toHaveLength(16)
-  })
-
-  test('does not repeat across many calls', () => {
-    const seen = new Set(Array.from({ length: 1000 }, () => generateToken()))
-    expect(seen.size).toBe(1000)
-  })
-})
-
-describe('safeEqual', () => {
-  test('matches identical strings', () => {
-    expect(safeEqual('token-abc', 'token-abc')).toBe(true)
-  })
-
-  test('rejects different strings', () => {
-    expect(safeEqual('token-abc', 'token-abd')).toBe(false)
-  })
-
-  test('rejects strings of differing length without throwing', () => {
-    // A raw timingSafeEqual throws on a length mismatch; ours must not, since
-    // attacker-controlled input reaches it.
-    expect(safeEqual('short', 'much-longer-value')).toBe(false)
-  })
-
-  test('handles empty strings', () => {
-    expect(safeEqual('', '')).toBe(true)
-    expect(safeEqual('', 'x')).toBe(false)
   })
 })

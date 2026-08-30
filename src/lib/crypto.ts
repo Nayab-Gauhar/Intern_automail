@@ -1,11 +1,5 @@
 import 'server-only'
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-  timingSafeEqual,
-  createHash,
-} from 'node:crypto'
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { env } from './env'
 
 /**
@@ -20,6 +14,9 @@ import { env } from './env'
  * The key version is carried in the payload so rotation is possible without a
  * migration: new writes use the current key, and reads fall back to
  * ENCRYPTION_KEY_PREVIOUS for records not yet re-encrypted.
+ *
+ * Token minting and hashing live in lib/tokens.ts — that half needs no key
+ * material, so it stays pure and directly testable.
  */
 
 const ALGORITHM = 'aes-256-gcm'
@@ -72,29 +69,4 @@ export function decrypt(payload: string): string {
 /** True when a payload was written with a superseded key and should be re-encrypted. */
 export function needsRotation(payload: string): boolean {
   return !payload.startsWith(`v${CURRENT_VERSION}.`)
-}
-
-/**
- * Hash a session or single-use token for storage. Session tokens are already
- * 256 bits of entropy, so a fast hash is correct here — SHA-256 protects a
- * leaked database dump without adding per-request cost. Passwords are different
- * and use argon2id via Bun.password.
- */
-export function hashToken(token: string): string {
-  return createHash('sha256').update(token).digest('base64url')
-}
-
-/** A cryptographically random, URL-safe token. 32 bytes = 256 bits. */
-export function generateToken(bytes = 32): string {
-  return randomBytes(bytes).toString('base64url')
-}
-
-/**
- * Constant-time comparison, safe for secrets. Length is compared first via a
- * fixed-size digest so differing lengths do not leak through timing.
- */
-export function safeEqual(a: string, b: string): boolean {
-  const ha = createHash('sha256').update(a).digest()
-  const hb = createHash('sha256').update(b).digest()
-  return timingSafeEqual(ha, hb)
 }
