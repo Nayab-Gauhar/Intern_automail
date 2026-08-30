@@ -25,11 +25,25 @@ import { NextResponse, type NextRequest } from 'next/server'
  */
 
 /**
- * Must match the cookie name set by src/server/session.ts. The __Host- prefix in
- * production requires Secure, host-only, and path=/ — a browser rejects the cookie
- * outright otherwise, which is the point of using it.
+ * Both possible session cookie names — checked as a set, deliberately.
+ *
+ * src/server/session.ts picks ONE of these at runtime from validated env
+ * (`__Host-im_session` in production, `im_session` otherwise). Middleware cannot
+ * reproduce that decision: `next build` inlines `process.env.NODE_ENV` as
+ * `'production'` and constant-folds the ternary, so the equivalent expression here
+ * compiles to the literal `"__Host-im_session"` regardless of the runtime value.
+ *
+ * That divergence was a real bug, not a theoretical one: with the server running at
+ * NODE_ENV=test it set `im_session`, middleware looked for `__Host-im_session`,
+ * found nothing, and bounced every authenticated request straight back to /login —
+ * while login itself had succeeded and written a valid session row.
+ *
+ * Checking both names is safe because this is only a cheap redirect hint, never a
+ * security boundary: presence of *a* cookie skips the redirect, and
+ * `requireWorkspace()` in the (app) layout still validates the session against the
+ * database. A forged cookie of either name gains nothing.
  */
-const SESSION_COOKIE = process.env.NODE_ENV === 'production' ? '__Host-im_session' : 'im_session'
+const SESSION_COOKIE_NAMES = ['__Host-im_session', 'im_session'] as const
 
 /** The (app) route group's URL prefixes. The group name itself never appears in a URL. */
 const APP_PREFIXES = [
@@ -53,7 +67,9 @@ export function middleware(req: NextRequest) {
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   )
 
-  if (isAppRoute && !req.cookies.has(SESSION_COOKIE)) {
+  const hasSessionCookie = SESSION_COOKIE_NAMES.some((name) => req.cookies.has(name))
+
+  if (isAppRoute && !hasSessionCookie) {
     const url = req.nextUrl.clone()
     url.pathname = '/login'
     url.search = ''

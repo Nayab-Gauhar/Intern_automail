@@ -56,15 +56,28 @@ export default defineConfig({
 
   // Build once, then serve. `next dev` would make every assertion race the
   // compiler on first hit.
+  //
+  // Two things here are load-bearing and were both found by a failing test:
+  //
+  // 1. `bun --bun` — the `next` binary's shebang is `#!/usr/bin/env node`, so a
+  //    plain `next start` serves the app under Node, where `Bun.password` does not
+  //    exist and every login throws. Production runs under Bun for the same reason
+  //    (see the `start` script and 09-deployment §7.2).
+  //
+  // 2. NODE_ENV is 'test', NOT 'production'. In production the session cookie is
+  //    `__Host-im_session` with `Secure`, and browsers reject both over plain
+  //    http:// — so the cookie is silently dropped and login appears to succeed
+  //    while landing back on /login. That is correct production behaviour; it just
+  //    means an http test server must not claim to be production.
   webServer: {
-    command: `bunx next start --port ${PORT}`,
+    command: `bun --bun next start --port ${PORT}`,
     url: BASE_URL,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
     stdout: 'pipe',
     stderr: 'pipe',
     env: {
-      NODE_ENV: 'production',
+      NODE_ENV: 'test',
       EMAIL_PROVIDER_MODE: 'fake',
     },
   },

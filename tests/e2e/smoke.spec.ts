@@ -47,20 +47,50 @@ test('the login page is keyboard operable and correctly labelled', async ({ page
   await expect(password).toBeFocused()
 })
 
-test('a bad login does not reveal whether the account exists', async ({ page }) => {
-  await page.goto('/login')
+test('a bad login fails cleanly without revealing whether the account exists', async ({ page }) => {
+  // Collect server-side failures. The first version of this test asserted only
+  // "an alert appears that does not say no-such-user" — which a 500 error page
+  // also satisfies. It passed green while login was throwing "auth requires the
+  // Bun runtime" on every attempt. Assert the absence of a server error
+  // explicitly, or the test cannot distinguish a working rejection from a crash.
+  const serverErrors: string[] = []
+  page.on('response', (r) => {
+    if (r.status() >= 500) serverErrors.push(`${r.status()} ${r.url()}`)
+  })
+  page.on('pageerror', (e) => serverErrors.push(`pageerror: ${e.message}`))
 
+  await page.goto('/login')
   await page.getByLabel(/email/i).fill('definitely-not-registered@example.com')
   await page.getByLabel(/password/i).fill('wrong-password-value')
   await page.getByRole('button', { name: /sign in|log ?in/i }).click()
 
-  // An error must appear...
-  const error = page.getByRole('alert')
-  await expect(error).toBeVisible()
+  // A rejection must reach the user...
+  await expect(page.getByRole('alert')).toBeVisible()
 
-  // ...but must not disclose which half was wrong. User enumeration is the
-  // vulnerability being tested for here.
-  await expect(error).not.toContainText(
-    /no (such )?(user|account)|not (found|registered)|unknown email/i,
+  // ...as an application error, not a crash.
+  expect(serverErrors).toEqual([])
+
+  // ...and must not disclose which half was wrong. Enumeration is the
+  // vulnerability under test.
+  await expect(page.getByRole('alert')).not.toContainText(
+    /no (such )?(user|account)|not (found|registered)|unknown email|went wrong|unexpected/i,
   )
+})
+
+test('the demo account can sign in and reach the dashboard', async ({ page }) => {
+  // The end-to-end proof that authentication actually works. Without it, every
+  // other test here passes against a login form that throws on submit.
+  const serverErrors: string[] = []
+  page.on('response', (r) => {
+    if (r.status() >= 500) serverErrors.push(`${r.status()} ${r.url()}`)
+  })
+
+  await page.goto('/login')
+  await page.getByLabel(/email/i).fill('owner@acme.test')
+  await page.getByLabel(/password/i).fill('instant-mail-demo-2026')
+  await page.getByRole('button', { name: /sign in|log ?in/i }).click()
+
+  await expect(page).toHaveURL(/\/dashboard/, { timeout: 15_000 })
+  expect(serverErrors).toEqual([])
+  await expect(page.getByRole('navigation')).toBeVisible()
 })

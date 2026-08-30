@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "bun --bun next start",
     "worker": "bun run worker/index.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
@@ -33,7 +33,8 @@
     "check": "bun run typecheck && bun run lint && bun run test:unit",
     "lint:fix": "eslint . --fix",
     "test:watch": "bun test --conditions react-server --watch tests/unit",
-    "db:verify": "bun run scripts/verify-db-objects.ts"
+    "db:verify": "bun run scripts/verify-db-objects.ts",
+    "start:node": "next start"
   },
   "prisma": {
     "seed": "bun run prisma/seed.ts"
