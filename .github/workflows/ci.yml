@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI-only throwaway values. Real secrets never live in this file; the app
+  # validates env at boot, so these must be present and well-formed.
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/instantmail_test?schema=public
+  DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/instantmail_test?schema=public
+  TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/instantmail_test?schema=public
+  APP_URL: http://localhost:3000
+  AUTH_SECRET: ci-only-not-a-real-secret-000000000000000=
+  ENCRYPTION_KEY: ci-only-not-a-real-key-00000000000000000000=
+  WORKER_AUTH_TOKEN: ci-only-worker-token
+  NODE_ENV: test
+
+jobs:
+  # Fast feedback: static checks need no database, so they must not wait on one.
+  static:
+    name: Typecheck & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Check formatting
+        run: bun run format:check
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
+      # The sending engine's invariants (idempotency, limits, scheduling,
+      # timezone/DST arithmetic) are the most expensive things to get wrong, so
+      # they are unit-tested and gate everything downstream.
+      - name: Unit tests
+        run: bun run test:unit
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instantmail_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - run: bun install --frozen-lockfile
+
+      # Proves migrations apply to an empty database, which is the only way to
+      # catch a migration that only works against a developer's existing data.
+      - name: Apply migrations from scratch
+        run: bunx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
+      - name: Integration tests
+        run: bun run test:integration
+
+  e2e:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    needs: [static, unit]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instantmail_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Selects the in-process fake email provider so the suite never touches
+      # real Gmail and stays deterministic.
+      EMAIL_PROVIDER_MODE: fake
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: Apply migrations
+        run: bunx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
+      - name: Seed database
+        run: bun run db:seed
+
+      - name: Build
+        run: bun run build
+
+      - name: Install Playwright browsers
+        run: bunx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: bun run test:e2e
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

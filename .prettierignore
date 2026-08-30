@@ -6,3 +6,8 @@ coverage
 playwright-report
 test-results
 .pgdata
+
+# Architecture docs are prose with hand-aligned ASCII diagrams and tables that
+# Prettier's markdown printer would mangle. Reviewed by humans, not formatters.
+docs/**/*.md
+*.md

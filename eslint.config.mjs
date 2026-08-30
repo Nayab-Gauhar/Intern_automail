@@ -70,7 +70,10 @@ export default tseslint.config(
         'error',
         {
           patterns: [
-            { group: ['@/modules/*', '@/server/*', '@/lib/db'], message: 'components/ui must be pure presentation.' },
+            {
+              group: ['@/modules/*', '@/server/*', '@/lib/db'],
+              message: 'components/ui must be pure presentation.',
+            },
           ],
         },
       ],
