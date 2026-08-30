@@ -2777,8 +2777,8 @@ Grepped against the schema, all zero:
 | `leadScore` | 2 | `Lead.score` |
 | `Lead.interestStatus`; `INTERESTED` / `MEETING` | 3 / 8 | `LeadStatus` has `ENGAGED`, no `INTERESTED`; interest is `AIAnalysis.classification` / `.sentiment` |
 | `aiCategory` (inbox folder filter) | 9 | `AIAnalysis.classification` + `MessageClassification` |
-| `z.nativeEnum(...)` | 1 | **zod 4 removed it** — use `z.enum(Object.values(E))` |
-| `z.string().uuid()` for ids | 3 | ids are `cuid()` — use `z.cuid()`; `.uuid()` rejects every real id |
+| `z.nativeEnum(...)` | 1 | still present in zod 4.5.4 but deprecated — prefer `z.enum(E)`. **Not** a runtime break; see DECISIONS D5 |
+| `z.string().uuid()` for ids | 3 | **real runtime bug** — ids are cuids and `.uuid()` rejects every one. Use `z.cuid()` (verified to accept our ids). Fixed in 03 |
 
 The last two are not renames, they are code that throws or rejects valid input at
 runtime. `08-analytics-crm-ai.md` §0 similarly names `Message` / `Thread` for

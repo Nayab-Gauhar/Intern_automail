@@ -1492,10 +1492,15 @@ Parsed once, server-side, with zod:
 // modules/leads/schema.ts
 export const leadListParams = z.object({
   q:        z.string().trim().max(200).optional(),
-  status:   z.string().transform(csv).pipe(z.array(z.nativeEnum(LeadStatus))).optional(),
-  campaign: z.string().uuid().optional(),
-  list:     z.string().uuid().optional(),
-  tag:      z.string().uuid().optional(),
+  // z.enum over the Prisma enum. z.nativeEnum still exists in zod 4.5.4 but is
+  // deprecated; z.enum accepts a native enum object directly.
+  status:   z.string().transform(csv).pipe(z.array(z.enum(LeadStatus))).optional(),
+  // z.cuid(), NOT z.uuid(). Our ids are cuids and z.uuid() rejects every one of
+  // them, which would make each of these filters reject all valid input.
+  // See docs/architecture/DECISIONS.md D5.
+  campaign: z.cuid().optional(),
+  list:     z.cuid().optional(),
+  tag:      z.cuid().optional(),
   missing:  z.enum(LEAD_FIELDS).optional(),
   sort:     z.enum(["lastName","email","companyName","status","lastActivityAt","createdAt","leadScore"])
               .default("createdAt"),

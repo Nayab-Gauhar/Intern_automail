@@ -156,8 +156,13 @@ copy-pasteable query that errors is worse than no query.
 z.string().uuid().safeParse('clzq1a2b3c4d5e6f7g8h9i0j').success  →  false
 ```
 
-Every affected route would reject every valid id. Real bug; must be `z.string()` with a
-cuid check, or `z.cuid2()` where the format matches.
+Every affected route would reject every valid id. **Fixed in `03-frontend.md`** using
+`z.cuid()`, which was verified to accept our ids:
+
+```
+z.cuid().safeParse('clzq1a2b3c4d5e6f7g8h9i0j').success   →  true
+z.uuid().safeParse('clzq1a2b3c4d5e6f7g8h9i0j').success   →  false
+```
 
 The same report claimed `z.nativeEnum` was "removed in zod 4" and would throw. **That is
 wrong** — it still exists in zod 4.5.4 (`typeof z.nativeEnum === 'function'`) and works. It
