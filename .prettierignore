@@ -11,3 +11,9 @@ test-results
 # Prettier's markdown printer would mangle. Reviewed by humans, not formatters.
 docs/**/*.md
 *.md
+
+# The design-token block is a hand-aligned table transcribed from
+# docs/architecture/04-design-system.md, which is the spec of record. Prettier
+# collapses the alignment and lowercases every hex value, producing a 419-line
+# diff that makes the file impossible to check against the spec.
+src/app/globals.css

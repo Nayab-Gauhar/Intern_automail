@@ -12,6 +12,7 @@ export default tseslint.config(
       'test-results/**',
       '.pgdata/**',
       'prisma/migrations/**',
+      '.scratch*/**',
       'next-env.d.ts',
     ],
   },

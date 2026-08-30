@@ -3,11 +3,13 @@ import type { NextConfig } from 'next'
 const nextConfig: NextConfig = {
   reactStrictMode: true,
 
-  // Fail the production build on type or lint errors. The default for `next
-  // build` is to ignore neither, but being explicit means a future config edit
-  // cannot silently weaken CI.
+  // Fail the production build on type errors. Being explicit means a future
+  // config edit cannot silently weaken CI.
+  //
+  // There is deliberately no `eslint` key: Next 16 removed both `next lint` and
+  // the config's eslint integration, so linting is a separate CI step running
+  // `eslint .` directly.
   typescript: { ignoreBuildErrors: false },
-  eslint: { ignoreDuringBuilds: false },
 
   // `pg` and the Prisma adapter are native/server-only; keep them out of any
   // bundling attempt so a stray client import fails loudly at build instead of

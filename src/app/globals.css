@@ -1,0 +1,381 @@
+/*
+ * Instant Mail design system.
+ *
+ * Assembled from docs/architecture/04-design-system.md, which is the spec of
+ * record. Tailwind v4 is CSS-first: there is no tailwind.config.js, so the
+ * theme below IS the configuration.
+ *
+ * Order matters: @import "tailwindcss" first, then :root tokens, then the
+ * @theme mapping that exposes them as utilities, then base styles, then custom
+ * utilities.
+ */
+@import "tailwindcss";
+
+/* globals.css — part 1 of 4: tokens */
+
+:root {
+  /* ---------- colour: ground & surfaces ---------- */
+  --bg:              #FBFAF8; /* warm off-white ground — never pure #FFF */
+  --bg-subtle:       #F5F3EF; /* recessed areas, table header fills */
+  --bg-hover:        #F1EEE8; /* row / menu-item hover on the ground */
+  --bg-active:       #EAE6DE; /* pressed, or selected row */
+  --surface:         #FFFFFF; /* raised cards/panels ON the off-white ground */
+  --surface-hover:   #FAF9F7; /* hover on a raised surface */
+
+  /* ---------- colour: ink ---------- */
+  --ink:             #0F1E37; /* deep navy — primary text */
+  --ink-secondary:   #43526B; /* secondary text, body copy at small sizes */
+  --ink-meta:        #64708A; /* information-bearing meta: timestamps, counts   */
+                              /* 4.7:1 on --bg. See §6 contrast ruling.         */
+  --ink-muted:       #7A879B; /* placeholders, disabled, decorative only (3.4:1)*/
+  --ink-inverse:     #FBFAF8; /* text on --accent / --danger fills */
+
+  /* ---------- colour: accent ---------- */
+  --accent:          #1B3A6B; /* navy accent — primary actions */
+  --accent-hover:    #16305A;
+  --accent-active:   #122649;
+  --accent-subtle:   #EDF1F7; /* selected nav item, info fill, focus wash */
+  --accent-border:   #C6D2E4; /* border on an accent-subtle fill */
+
+  /* ---------- colour: borders ---------- */
+  --border:          #E6E2DA; /* hairline, warm — the default separator */
+  --border-strong:   #D2CCC1; /* emphasised structural divider */
+  --border-control:  #8F887C; /* form-control outlines ONLY — 3.4:1, WCAG 1.4.11 */
+
+  /* ---------- colour: status (muted, editorial, never neon) ---------- */
+  --success:         #2F6F4F;
+  --success-subtle:  #ECF2EE;
+  --success-border:  #C8DBCF;
+  --warning:         #9A6B1F;
+  --warning-subtle:  #F8F1E3;
+  --warning-border:  #E6D5B4;
+  --danger:          #A03A32;
+  --danger-hover:    #8A322B;
+  --danger-active:   #762A24;
+  --danger-subtle:   #F9EDEC;
+  --danger-border:   #E8CBC8;
+  --info:            #2C5A8A;
+  --info-subtle:     #EDF2F8;
+  --info-border:     #C9D8E8;
+
+  /* ---------- colour: focus & overlay ---------- */
+  --ring:            #1B3A6B;                 /* 11:1 on --bg */
+  --ring-danger:     #A03A32;                 /* focus ring inside destructive fills */
+  --overlay:         rgb(15 30 55 / 0.28);    /* modal / drawer scrim */
+
+  /* ---------- colour: charts (muted editorial, max 6 series) ---------- */
+  --chart-1: #1B3A6B; /* navy    */
+  --chart-2: #2F6F4F; /* pine    */
+  --chart-3: #9A6B1F; /* ochre   */
+  --chart-4: #6E7F99; /* slate   */
+  --chart-5: #A03A32; /* clay    */
+  --chart-6: #8C6E4F; /* umber   */
+  --chart-grid:  #EDE9E1;  /* horizontal gridlines only */
+  --chart-axis:  #7A879B;  /* tick labels */
+  --chart-muted: #C9C3B8;  /* previous period / benchmark line */
+
+  /* ---------- typography families (values come from next/font, §7) ---------- */
+  --font-sans:  var(--font-inter),             ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-instrument-serif),  ui-serif, Georgia, serif;
+  --font-mono:  var(--font-jetbrains-mono),    ui-monospace, SFMono-Regular, monospace;
+
+  /* ---------- radii ---------- */
+  --radius-xs:   4px;  /* checkbox, tiny chips */
+  --radius-sm:   6px;  /* inputs, buttons (non-pill), menu items */
+  --radius-md:  10px;  /* cards, panels, popovers */
+  --radius-lg:  14px;  /* modals, drawers, hero panels */
+  --radius-pill: 999px;/* primary actions + filter chips ONLY */
+
+  /* ---------- shadows (barely there; no glow, no colour) ---------- */
+  --shadow-xs: 0 1px 2px rgb(15 30 55 / 0.04);
+  --shadow-sm: 0 1px 3px rgb(15 30 55 / 0.06);
+  --shadow-md: 0 4px 16px rgb(15 30 55 / 0.08);  /* overlays */
+  --shadow-lg: 0 12px 32px rgb(15 30 55 / 0.10); /* modal only */
+
+  /* ---------- layout ---------- */
+  --sidebar-w:           248px;
+  --sidebar-w-collapsed:  64px;
+  --header-h:             60px;
+  --page-max:           1280px; /* app content column cap */
+  --prose-max:            68ch; /* long-form text (help, AI summaries) */
+  --form-max:            560px; /* single-column form column */
+  --gutter:               20px; /* overridden per breakpoint in §11 */
+
+  /* ---------- z-index (the complete ladder; nothing outside it) ---------- */
+  --z-base:      0;
+  --z-sticky:  100; /* sticky table header, page header */
+  --z-dropdown:200;
+  --z-overlay: 300; /* scrim */
+  --z-modal:   400; /* dialog, drawer */
+  --z-popover: 500; /* popover/menu opened FROM a modal */
+  --z-toast:   600;
+  --z-tooltip: 700;
+
+  /* ---------- motion ---------- */
+  --duration-fast: 120ms; /* hover, colour change, tooltip */
+  --duration:      160ms; /* default: menus, tabs, toasts */
+  --duration-slow: 200ms; /* dialogs, drawers — the ceiling */
+  --ease-out:    cubic-bezier(0.22, 1, 0.36, 1); /* entrances, expansion */
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);   /* moves between two states */
+}
+
+/* globals.css — part 2 of 4 */
+@theme inline {
+  /* colours → bg-*, text-*, border-*, ring-*, fill-*, stroke-* */
+  --color-bg:             var(--bg);
+  --color-bg-subtle:      var(--bg-subtle);
+  --color-bg-hover:       var(--bg-hover);
+  --color-bg-active:      var(--bg-active);
+  --color-surface:        var(--surface);
+  --color-surface-hover:  var(--surface-hover);
+
+  --color-ink:            var(--ink);
+  --color-ink-secondary:  var(--ink-secondary);
+  --color-ink-meta:       var(--ink-meta);
+  --color-ink-muted:      var(--ink-muted);
+  --color-ink-inverse:    var(--ink-inverse);
+
+  --color-accent:         var(--accent);
+  --color-accent-hover:   var(--accent-hover);
+  --color-accent-active:  var(--accent-active);
+  --color-accent-subtle:  var(--accent-subtle);
+  --color-accent-border:  var(--accent-border);
+
+  --color-border:         var(--border);
+  --color-border-strong:  var(--border-strong);
+  --color-border-control: var(--border-control);
+
+  --color-success:        var(--success);
+  --color-success-subtle: var(--success-subtle);
+  --color-success-border: var(--success-border);
+  --color-warning:        var(--warning);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-warning-border: var(--warning-border);
+  --color-danger:         var(--danger);
+  --color-danger-hover:   var(--danger-hover);
+  --color-danger-active:  var(--danger-active);
+  --color-danger-subtle:  var(--danger-subtle);
+  --color-danger-border:  var(--danger-border);
+  --color-info:           var(--info);
+  --color-info-subtle:    var(--info-subtle);
+  --color-info-border:    var(--info-border);
+
+  --color-ring:           var(--ring);
+  --color-overlay:        var(--overlay);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-grid:  var(--chart-grid);
+  --color-chart-axis:  var(--chart-axis);
+  --color-chart-muted: var(--chart-muted);
+
+  /* families → font-sans, font-serif, font-mono */
+  --font-sans:  var(--font-sans);
+  --font-serif: var(--font-serif);
+  --font-mono:  var(--font-mono);
+
+  /* spacing: 4px base. Utilities p-1..p-24 etc. resolve to calc(n * 0.25rem). */
+  --spacing: 0.25rem;
+
+  /* radii → rounded-xs|sm|md|lg|pill. Tailwind's defaults are replaced. */
+  --radius-xs:   var(--radius-xs);
+  --radius-sm:   var(--radius-sm);
+  --radius-md:   var(--radius-md);
+  --radius-lg:   var(--radius-lg);
+  --radius-pill: var(--radius-pill);
+
+  /* shadows → shadow-xs|sm|md|lg */
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+
+  /* easing → ease-out (overridden), ease-in-out (overridden) */
+  --ease-out:    var(--ease-out);
+  --ease-in-out: var(--ease-in-out);
+
+  /* type scale → text-display-xl … text-mono, each carrying lh/tracking/weight */
+  --text-display-xl: 3.5rem;
+  --text-display-xl--line-height: 1.04;
+  --text-display-xl--letter-spacing: -0.02em;
+  --text-display-xl--font-weight: 400;
+
+  --text-display-lg: 2.5rem;
+  --text-display-lg--line-height: 1.08;
+  --text-display-lg--letter-spacing: -0.015em;
+  --text-display-lg--font-weight: 400;
+
+  --text-display-md: 1.875rem;
+  --text-display-md--line-height: 1.15;
+  --text-display-md--letter-spacing: -0.01em;
+  --text-display-md--font-weight: 400;
+
+  --text-heading: 1.125rem;
+  --text-heading--line-height: 1.4;
+  --text-heading--letter-spacing: -0.01em;
+  --text-heading--font-weight: 600;
+
+  --text-subheading: 1rem;
+  --text-subheading--line-height: 1.5;
+  --text-subheading--letter-spacing: -0.005em;
+  --text-subheading--font-weight: 500;
+
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.6;
+  --text-body--letter-spacing: 0em;
+  --text-body--font-weight: 400;
+
+  --text-body-sm: 0.875rem;
+  --text-body-sm--line-height: 1.55;
+  --text-body-sm--letter-spacing: 0em;
+  --text-body-sm--font-weight: 400;
+
+  --text-label: 0.8125rem;
+  --text-label--line-height: 1.4;
+  --text-label--letter-spacing: 0em;
+  --text-label--font-weight: 500;
+
+  --text-micro: 0.6875rem;
+  --text-micro--line-height: 1.3;
+  --text-micro--letter-spacing: 0.08em;
+  --text-micro--font-weight: 500;
+
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1.45;
+  --text-caption--letter-spacing: 0.01em;
+  --text-caption--font-weight: 400;
+
+  --text-mono: 0.8125rem;
+  --text-mono--line-height: 1.5;
+  --text-mono--letter-spacing: 0em;
+  --text-mono--font-weight: 400;
+
+  /* keyframes we own — replaces tailwindcss-animate / tw-animate-css */
+  --animate-fade-in:     fade-in     var(--duration) var(--ease-out);
+  --animate-fade-out:    fade-out    var(--duration-fast) ease-in;
+  --animate-scale-in:    scale-in    var(--duration-slow) var(--ease-out);
+  --animate-slide-up:    slide-up    var(--duration) var(--ease-out);
+  --animate-slide-right: slide-right var(--duration-slow) var(--ease-out);
+  --animate-shimmer:     shimmer     1.4s linear infinite;
+}
+
+/* globals.css — part 3 of 4 */
+@layer base {
+  *, *::before, *::after { border-color: var(--border); }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    /* Inter: contextual alternates + disambiguated shapes. No stylistic ss0x
+       beyond this — we are not designing a typeface. */
+    font-feature-settings: "cv05" 1, "cv08" 1, "calt" 1;
+  }
+
+  /* Numbers must not jitter between renders in tables and metrics. */
+  table, [data-tabular] { font-variant-numeric: tabular-nums; }
+
+  h1, h2, h3, h4 { font-weight: inherit; text-wrap: balance; }
+  p { text-wrap: pretty; }
+
+  /* Focus: one ruling for the whole app. Never remove without replacing. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+    border-radius: inherit;
+  }
+  :focus:not(:focus-visible) { outline: none; }
+
+  ::selection { background: var(--accent-subtle); color: var(--ink); }
+
+  ::placeholder { color: var(--ink-muted); opacity: 1; }
+
+  /* Scrollbars: thin and warm, not chrome-default grey. */
+  * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: var(--radius-pill);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  [hidden] { display: none !important; }
+}
+
+@keyframes fade-in     { from { opacity: 0 } to { opacity: 1 } }
+@keyframes fade-out    { from { opacity: 1 } to { opacity: 0 } }
+@keyframes scale-in    { from { opacity: 0; transform: scale(0.98) translateY(4px) }
+                         to   { opacity: 1; transform: none } }
+@keyframes slide-up    { from { opacity: 0; transform: translateY(6px) }
+                         to   { opacity: 1; transform: none } }
+@keyframes slide-right { from { transform: translateX(100%) }
+                         to   { transform: none } }
+@keyframes shimmer     { from { background-position: -200% 0 }
+                         to   { background-position: 200% 0 } }
+
+/* The global motion kill-switch. Nothing overrides this. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* globals.css — part 4 of 4 */
+@utility z-sticky   { z-index: var(--z-sticky); }
+@utility z-dropdown { z-index: var(--z-dropdown); }
+@utility z-overlay  { z-index: var(--z-overlay); }
+@utility z-modal    { z-index: var(--z-modal); }
+@utility z-popover  { z-index: var(--z-popover); }
+@utility z-toast    { z-index: var(--z-toast); }
+@utility z-tooltip  { z-index: var(--z-tooltip); }
+
+/* The three text-family shorthands, so no component re-states fallbacks. */
+@utility font-display { font-family: var(--font-serif); font-weight: 400; }
+
+/* Page gutter — one utility, responsive inside, used by shell + full-bleed rows */
+@utility gutter-x {
+  padding-inline: 20px;
+  @media (width >= 768px)  { padding-inline: 32px; }
+  @media (width >= 1024px) { padding-inline: 40px; }
+  @media (width >= 1280px) { padding-inline: 56px; }
+}
+
+/* Skeleton sheen. Only place a gradient is legal, and it is motion, not decor. */
+@utility skeleton {
+  background-color: var(--bg-subtle);
+  background-image: linear-gradient(90deg,
+    transparent 0%, rgb(255 255 255 / 0.6) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: var(--animate-shimmer);
+  border-radius: var(--radius-sm);
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { background-image: none; }
+}
+
+/* Truncation at N lines — used by email previews and AI summaries. */
+@utility clamp-* {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: --value(integer);
+  overflow: hidden;
+}
