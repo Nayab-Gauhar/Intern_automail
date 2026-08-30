@@ -29,7 +29,13 @@ const schema = z.object({
   DIRECT_DATABASE_URL: z.string().optional(),
   TEST_DATABASE_URL: z.string().optional(),
 
-  APP_URL: z.url(),
+  /**
+   * Restricted to http/https. Bare `z.url()` is lenient about protocol and
+   * accepts `javascript:alert(1)`, `mailto:`, `ftp://`, and `localhost:3000`
+   * without a scheme — verified. APP_URL is used to build redirect and callback
+   * URLs, so an unexpected scheme here is a real hazard rather than a typo.
+   */
+  APP_URL: z.url({ protocol: /^https?$/ }),
 
   AUTH_SECRET: z.string().min(32, 'must be at least 32 characters'),
   ENCRYPTION_KEY: base64Key32,
@@ -41,7 +47,7 @@ const schema = z.object({
   // surfaces an honest "not configured" state rather than crashing.
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
-  GOOGLE_REDIRECT_URI: z.union([z.url(), z.literal('')]).optional(),
+  GOOGLE_REDIRECT_URI: z.union([z.url({ protocol: /^https?$/ }), z.literal('')]).optional(),
   GMAIL_PUBSUB_VERIFICATION_TOKEN: z.string().optional(),
   GMAIL_PUBSUB_TOPIC: z.string().optional(),
 
