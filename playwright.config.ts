@@ -1,3 +1,6 @@
+// Playwright does not read .env, so global setup and the web server would both
+// start without DATABASE_URL. Loaded here rather than in each consumer.
+import 'dotenv/config'
 import { defineConfig, devices } from '@playwright/test'
 
 /**
@@ -15,6 +18,10 @@ const BASE_URL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`
 
 export default defineConfig({
   testDir: './tests/e2e',
+  // Clears rate-limit counters and login locks. The suite performs real logins,
+  // so without this a few consecutive runs exhaust the limiter and the sign-in
+  // test fails for a reason that looks exactly like broken authentication.
+  globalSetup: './tests/e2e/global-setup.ts',
   // Give the whole run a ceiling so a hung test cannot occupy CI indefinitely.
   timeout: 30_000,
   expect: { timeout: 5_000 },
