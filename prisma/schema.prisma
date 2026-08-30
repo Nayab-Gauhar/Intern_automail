@@ -557,10 +557,14 @@ model Workspace {
   /// workspace ceiling, only per-mailbox limits apply.
   dailySendLimit Int?
 
-  /// When true, every outbound campaign email gets a tracking pixel unless the
-  /// campaign overrides it. Tracking is opt-out per campaign.
-  trackOpensDefault  Boolean @default(true)
-  trackClicksDefault Boolean @default(true)
+  /// Default tracking for new campaigns in this workspace; each campaign may
+  /// override it. Defaults to FALSE — see docs/architecture/DECISIONS.md D2. A
+  /// tracking pixel is a remote image in a cold email from an unknown sender,
+  /// which costs deliverability, and open rate is explicitly labelled indicative
+  /// rather than factual. Paying inbox placement for a metric no decision may
+  /// rest on is a bad trade.
+  trackOpensDefault  Boolean @default(false)
+  trackClicksDefault Boolean @default(false)
 
   /// Appended to every campaign email body. Required for CAN-SPAM/GDPR posture.
   unsubscribeFooterHtml String?
@@ -1351,8 +1355,9 @@ model Campaign {
   stopOnClick   Boolean @default(false)
   stopOnOpen    Boolean @default(false)
 
-  trackOpens  Boolean @default(true)
-  trackClicks Boolean @default(true)
+  /// Seeded from the workspace default at creation. Off by default (DECISIONS D2).
+  trackOpens  Boolean @default(false)
+  trackClicks Boolean @default(false)
 
   /// Skip a lead already enrolled in another ACTIVE campaign. Prevents the same
   /// person receiving two unrelated sequences in the same week.

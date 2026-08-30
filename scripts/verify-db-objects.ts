@@ -61,7 +61,12 @@ const EXPECTED: Expected[] = [
   {
     name: 'EmailEvent_no_update',
     check: 'trigger',
-    why: 'makes EmailEvent append-only, so analytics history cannot be rewritten',
+    why: 'EmailEvent UPDATE is never permitted — a recorded fact must not be edited',
+  },
+  {
+    name: 'EmailEvent_no_delete',
+    check: 'trigger',
+    why: 'EmailEvent DELETE is blocked except in a transaction that opts into the purge',
   },
 ]
 

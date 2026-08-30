@@ -230,4 +230,86 @@ describe('cascade behaviour', () => {
     )
     expect(rows[0]!.count).toBe('0')
   })
+
+  // REGRESSION: the first version of the append-only trigger raised on every
+  // DELETE, including the FK cascade from Workspace. That made workspace
+  // deletion impossible with no error saying so — the purge just rolled back.
+  // The original test passed only because it created no EmailEvent rows.
+  test('a workspace with events cannot be deleted without opting into the purge', async () => {
+    await makeWorkspace('w-guard')
+    await testDb.query(
+      `INSERT INTO "EmailEvent" ("workspaceId", type, "dedupeKey") VALUES ('w-guard','SENT','g1')`,
+    )
+
+    await expectViolation(
+      () => testDb.query(`DELETE FROM "Workspace" WHERE id='w-guard'`),
+      /append-only/i,
+    )
+
+    // The whole statement must roll back, not partially apply.
+    const { rows } = await testDb.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "Workspace" WHERE id='w-guard'`,
+    )
+    expect(rows[0]!.count).toBe('1')
+  })
+
+  test('the deliberate purge path deletes a workspace and its events', async () => {
+    await makeWorkspace('w-purge')
+    await testDb.query(
+      `INSERT INTO "EmailEvent" ("workspaceId", type, "dedupeKey") VALUES ('w-purge','SENT','p1')`,
+    )
+
+    // What the MAINTENANCE purge job does: opt in for this transaction only.
+    await testDb.query('BEGIN')
+    await testDb.query(`SET LOCAL instantmail.allow_event_purge = 'on'`)
+    await testDb.query(`DELETE FROM "Workspace" WHERE id='w-purge'`)
+    await testDb.query('COMMIT')
+
+    const ws = await testDb.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "Workspace" WHERE id='w-purge'`,
+    )
+    const ev = await testDb.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "EmailEvent" WHERE "workspaceId"='w-purge'`,
+    )
+    expect(ws.rows[0]!.count).toBe('0')
+    expect(ev.rows[0]!.count).toBe('0')
+  })
+
+  test('the purge opt-in does not leak past its transaction', async () => {
+    await makeWorkspace('w-leak')
+    await testDb.query(
+      `INSERT INTO "EmailEvent" ("workspaceId", type, "dedupeKey") VALUES ('w-leak','SENT','lk1')`,
+    )
+
+    // Burn a transaction that sets the flag, so a leaked SET would show up here.
+    await testDb.query('BEGIN')
+    await testDb.query(`SET LOCAL instantmail.allow_event_purge = 'on'`)
+    await testDb.query('COMMIT')
+
+    await expectViolation(
+      () => testDb.query(`DELETE FROM "EmailEvent" WHERE "workspaceId"='w-leak'`),
+      /append-only/i,
+    )
+  })
+
+  test('UPDATE has no escape hatch even inside the purge transaction', async () => {
+    await makeWorkspace('w-noupd')
+    await testDb.query(
+      `INSERT INTO "EmailEvent" ("workspaceId", type, "dedupeKey") VALUES ('w-noupd','SENT','nu1')`,
+    )
+
+    await testDb.query('BEGIN')
+    await testDb.query(`SET LOCAL instantmail.allow_event_purge = 'on'`)
+    let threw = false
+    try {
+      await testDb.query(`UPDATE "EmailEvent" SET type='OPENED' WHERE "workspaceId"='w-noupd'`)
+    } catch {
+      threw = true
+    }
+    await testDb.query('ROLLBACK')
+
+    // The purge flag exists to let a cascade delete through. Editing a recorded
+    // fact is never legitimate, so UPDATE uses a separate strict function.
+    expect(threw).toBe(true)
+  })
 })
