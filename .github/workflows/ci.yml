@@ -18,7 +18,10 @@ env:
   TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/instantmail_test?schema=public
   APP_URL: http://localhost:3000
   AUTH_SECRET: ci-only-not-a-real-secret-000000000000000=
-  ENCRYPTION_KEY: ci-only-not-a-real-key-00000000000000000000=
+  # Must be valid base64 decoding to exactly 32 bytes or env.ts rejects it at boot
+  # and every job fails. Decodes to the ASCII "ciOnlyNotARealKeyDoNotUse0000000",
+  # so a leaked CI log shows an obvious dummy rather than something key-shaped.
+  ENCRYPTION_KEY: Y2lPbmx5Tm90QVJlYWxLZXlEb05vdFVzZTAwMDAwMDA=
   WORKER_AUTH_TOKEN: ci-only-worker-token
   NODE_ENV: test
 
