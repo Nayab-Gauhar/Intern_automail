@@ -102,6 +102,12 @@ jobs:
       - name: Apply migrations from scratch
         run: bunx prisma migrate deploy
 
+      # prisma migrate diff proposes DROPping the hand-written partial/GIN indexes
+      # and the append-only trigger on every run, because it cannot see them in
+      # schema.prisma. Losing one is silent. See INTEGRATION-NOTES.md §11.
+      - name: Verify hand-written database objects
+        run: bun run db:verify
+
       - name: Generate Prisma client
         run: bunx prisma generate
 
@@ -143,6 +149,9 @@ jobs:
 
       - name: Apply migrations
         run: bunx prisma migrate deploy
+
+      - name: Verify hand-written database objects
+        run: bun run db:verify
 
       - name: Generate Prisma client
         run: bunx prisma generate

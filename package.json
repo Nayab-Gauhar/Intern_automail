@@ -32,7 +32,8 @@
     "test:e2e": "playwright test",
     "check": "bun run typecheck && bun run lint && bun run test:unit",
     "lint:fix": "eslint . --fix",
-    "test:watch": "bun test --conditions react-server --watch tests/unit"
+    "test:watch": "bun test --conditions react-server --watch tests/unit",
+    "db:verify": "bun run scripts/verify-db-objects.ts"
   },
   "prisma": {
     "seed": "bun run prisma/seed.ts"

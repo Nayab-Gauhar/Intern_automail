@@ -22,7 +22,13 @@ export default defineConfig({
      * A throwaway database Prisma replays migrations into, so it can compute a
      * diff and detect drift without touching the dev database. Prisma resets it
      * on every use, so it must never point at anything real.
+     *
+     * Spread conditionally: tsconfig sets exactOptionalPropertyTypes, so passing
+     * an explicit `undefined` to an optional property is a type error. Omitting
+     * the key is what "not configured" must look like.
      */
-    shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL,
+    ...(process.env.SHADOW_DATABASE_URL
+      ? { shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL }
+      : {}),
   },
 })
