@@ -18,5 +18,11 @@ export default defineConfig({
   },
   datasource: {
     url: process.env.DIRECT_DATABASE_URL || env('DATABASE_URL'),
+    /**
+     * A throwaway database Prisma replays migrations into, so it can compute a
+     * diff and detect drift without touching the dev database. Prisma resets it
+     * on every use, so it must never point at anything real.
+     */
+    shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL,
   },
 })

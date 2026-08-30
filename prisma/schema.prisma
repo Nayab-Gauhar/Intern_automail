@@ -2600,3 +2600,30 @@ model Job {
   @@index([type, state])
   @@index([scheduledEmailId])
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RATE LIMITING
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fixed-window rate-limit counter. See docs/architecture/07-auth-and-security.md §14.
+///
+/// Deliberately NOT tenant-owned: the key may be an IP or an email address seen
+/// before any workspace exists (registration, login, password reset). That makes
+/// it the third documented exception to the workspaceId rule, alongside AuditLog
+/// and WebhookEvent — and unlike those two it is ephemeral, since MAINTENANCE
+/// deletes every row whose window has closed.
+model RateLimit {
+  /// "<bucket>:<identity>:<windowStartEpochSeconds>", e.g.
+  /// "login:ip:203.0.113.7:1756600000". Putting the window in the key is what
+  /// makes the limiter a single atomic upsert with no read-modify-write.
+  key   String @id
+  count Int    @default(1)
+
+  /// When this window closes. Drives both the Retry-After header and the sweeper.
+  expiresAt DateTime @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Makes `DELETE FROM "RateLimit" WHERE "expiresAt" < now()` cheap.
+  @@index([expiresAt])
+}

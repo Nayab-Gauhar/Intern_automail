@@ -165,3 +165,54 @@ CampaignLead_campaignId_leadId_key                  no duplicate enrollment
 Job_state_runAt_priority_idx                        queue lease path
 Job_state_leaseExpiresAt_idx                        dead-worker job reclamation
 ```
+
+## 11. ⚠️ `prisma migrate diff` proposes DROPPING our hand-written indexes
+
+**Read this before committing any generated migration.**
+
+`prisma/migrations/20260830212002_init/migration.sql` ends with a hand-written block of eight
+objects Prisma's schema language cannot express: two partial indexes on the hottest paths
+(`Job_leasable_idx`, `ScheduledEmail_due_idx`), three partial/plain uniques enforcing business
+rules, two GIN indexes, and the `EmailEvent` append-only trigger.
+
+Prisma computes a diff from `schema.prisma` alone. It cannot see those objects, so it treats
+them as foreign and emits `DROP INDEX` for them. Generating the `RateLimit` migration produced:
+
+```sql
+-- DropIndex
+DROP INDEX "EmailMessage_references_gin";
+DROP INDEX "EmailThread_participants_gin";
+DROP INDEX "WarmupPoolMember_emailAccount_unique";
+-- CreateTable ... (the change actually wanted)
+```
+
+Committing that unnoticed would have silently deleted a uniqueness guarantee and two indexes
+that exist to avoid sequential scans — with no error, just a slow, subtly wrong system.
+
+**Every future `migrate diff` will propose the same deletions.** The workflow is therefore:
+
+1. Generate into a file, never straight into a commit.
+2. Read the SQL. Strip any `DROP` touching an object from the init migration's hand-written
+   block.
+3. Apply with `migrate deploy`, then verify the objects still exist:
+
+```sql
+SELECT indexname FROM pg_indexes WHERE indexname IN (
+  'Job_leasable_idx', 'ScheduledEmail_due_idx', 'WorkspaceInvite_pending_unique',
+  'Experiment_live_per_step_unique', 'EmailMessage_references_gin',
+  'EmailThread_participants_gin', 'WarmupPoolMember_emailAccount_unique');
+SELECT tgname FROM pg_trigger WHERE tgname = 'EmailEvent_no_update';
+```
+
+All eight must be present. This check belongs in CI before it bites someone.
+
+### Two smaller findings from the same exercise
+
+- **`migration_lock.toml` was missing.** Prisma writes it when `migrate dev` scaffolds a
+  migration; the init directory was hand-created, so it never appeared, and
+  `migrate diff --from-migrations` failed with *"Could not determine the connector from the
+  migrations directory"*. Now committed with `provider = "postgresql"`.
+- **`--from-migrations` requires a shadow database.** Prisma replays migrations into a
+  throwaway database to compute the diff. `prisma.config.ts` now reads
+  `SHADOW_DATABASE_URL` (`instantmail_shadow` locally). Prisma **resets** it on every use, so
+  it must never point at anything real.
