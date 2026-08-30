@@ -3,19 +3,38 @@
 Running list of fixes the lead applies when merging agent work. Each entry is a real defect
 found by running tooling, not a style preference.
 
-## 1. Prisma 7 removed `directUrl` from the schema (BREAKING)
+## 1. Prisma 7 removed BOTH `url` and `directUrl` from the schema (BREAKING)
 
-`prisma validate` fails with:
+`prisma validate` fails on each:
+
+> The datasource property `url` is no longer supported in schema files. Move connection
+> URLs for Migrate to `prisma.config.ts` and pass either `adapter` for a direct database
+> connection or `accelerateUrl` to the `PrismaClient` constructor.
 
 > The datasource property `directUrl` is no longer supported in schema files.
-> Move connection URLs to `prisma.config.ts`.
 
-In Prisma 7 the `datasource` block accepts `provider` and `url` only. A pooled/direct URL
-split now lives in `prisma.config.ts` at the repo root.
+This is broader than it first appears. In Prisma 7 the `datasource` block carries
+**`provider` only** — no connection URL at all. Connection handling splits in two:
 
-**Fix:** drop `directUrl` from `prisma/schema.prisma`; carry `DIRECT_DATABASE_URL` in
-`prisma.config.ts` instead. Any architecture doc showing `directUrl` in the schema is
-describing Prisma ≤6 and must be corrected.
+| Consumer | Where the URL comes from |
+|---|---|
+| Migrate / introspection CLI | `datasource.url` in **`prisma.config.ts`** |
+| `PrismaClient` at runtime | a **driver adapter** (`@prisma/adapter-pg`), not a URL |
+
+**Fix applied:**
+- `prisma.config.ts` at the repo root supplies `datasource.url` for CLI commands,
+  preferring `DIRECT_DATABASE_URL` (migrations must not run through a transaction-mode
+  pooler) and falling back to `DATABASE_URL`.
+- `@prisma/adapter-pg@7.10.0` + `pg@8.23.0` are dependencies; `src/lib/db.ts` constructs
+  `PrismaClient` with `new PrismaPg(...)`.
+- `dotenv` is a **direct** devDependency because `prisma.config.ts` imports it; it was
+  present only transitively, which would break on any dependency reshuffle.
+- `next.config.ts` lists `@prisma/client`, `@prisma/adapter-pg`, and `pg` in
+  `serverExternalPackages` so a stray client-side import fails at build rather than
+  shipping a broken bundle.
+
+**Schema owner must remove the `url` and `directUrl` lines** from the `datasource` block.
+Any doc showing a URL in `schema.prisma` describes Prisma ≤6 and is wrong for this repo.
 
 ## 2. `@types/react-dom` does not track React's version
 
