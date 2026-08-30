@@ -211,3 +211,30 @@ is unchanged and now harder to bypass than before.
 Any future file needing the client must either be a `repo.ts` or be added to that ignore list
 in a commit that says why. Three entries is a reviewable list; a rule with a silent bypass is
 not.
+
+---
+
+## D7 — The lucide icon names in `04-design-system.md` are fine; no rename needed
+
+**Status:** decided. No change to the docs or components.
+
+The UI agent reported that `Loader2`, `AlertCircle`, and `AlertTriangle` are "stale against
+lucide-react v1.37.0" and should become `LoaderCircle`, `CircleAlert`, and `TriangleAlert`,
+citing a grep of the type declarations.
+
+**Verified by importing them, and the report is wrong.** All six names resolve, and each pair
+is the *same component object*:
+
+```
+Loader2 === LoaderCircle          true
+AlertCircle === CircleAlert       true
+AlertTriangle === TriangleAlert   true
+```
+
+They are deprecated **aliases**, not removals. Nothing breaks, at build time or at runtime.
+
+Recorded for the same reason as D5's `z.nativeEnum` correction: a fabricated breakage costs as
+much to chase as a real one, and this is the second report of that shape. The new-style names
+are mildly preferable in new code, but rewriting six doc references and the components that
+already use both spellings buys nothing. **A grep of a `.d.ts` file is not a compatibility
+test — importing the symbol is.**

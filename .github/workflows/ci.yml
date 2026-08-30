@@ -140,6 +140,10 @@ jobs:
       # Selects the in-process fake email provider so the suite never touches
       # real Gmail and stays deterministic.
       EMAIL_PROVIDER_MODE: fake
+      # NOT production: in production the session cookie is __Host-im_session with
+      # Secure, which browsers reject over the plain http:// test server, so login
+      # would appear to succeed while the cookie was silently dropped.
+      NODE_ENV: test
 
     steps:
       - uses: actions/checkout@v5
