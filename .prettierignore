@@ -1,0 +1,8 @@
+node_modules
+.next
+bun.lock
+prisma/migrations
+coverage
+playwright-report
+test-results
+.pgdata
