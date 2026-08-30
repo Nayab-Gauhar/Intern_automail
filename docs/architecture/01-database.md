@@ -1185,3 +1185,550 @@ Three details that matter:
 This is also why integration tests must **not** wrap tests in a rolled-back
 transaction: one connection cannot exercise `SKIP LOCKED` at all, so the entire
 lease mechanism would be untestable. See §9.
+
+---
+
+## 7. Deletion semantics
+
+All 123 FKs declare an explicit `onDelete`: **81 `Cascade`, 42 `SetNull`**.
+Nothing is left to the ORM's default, because the default is invisible in review
+and wrong roughly half the time.
+
+The governing rule:
+
+> **`Cascade` when the child is meaningless without the parent. `SetNull` when
+> the child is a fact that outlives the parent.**
+
+A `LeadTagLink` without its tag is nonsense — cascade. An `EmailEvent` without
+its campaign is still a true statement about something that happened — set null.
+Applying that rule consistently is what lets us delete a campaign without
+destroying the analytics history that proves what it did.
+
+### 7.1 The choices that matter
+
+| Relation | Choice | Why, and what would be destroyed by the wrong choice |
+|---|---|---|
+| `EmailEvent.campaignId → Campaign` | **SetNull** | The fact log must survive campaign deletion. `Cascade` here would **delete the entire history of every send a campaign ever made** the moment someone deletes it — all rates, all attribution, all evidence, gone, and unrecoverable because `EmailEvent` is the source of truth rather than a derived cache. This is the single most consequential `onDelete` in the schema. |
+| `EmailEvent.emailAccountId / leadId / threadId / scheduledEmailId / sequenceStepId / variantId / emailMessageId / campaignLeadId` | **SetNull** (all 9 dimensions) | Same reasoning, per dimension. Any one of them set to `Cascade` would let deleting a mailbox, a lead, a step, or a variant silently delete slices of history. Nine chances to get it wrong; all nine are `SetNull`. |
+| `EmailMessage.campaignLeadId → CampaignLead` | **SetNull** | **Deleting a campaign must never delete a real email out of a customer's mailbox.** The message is a record of a conversation with a human. Cascade here would destroy inbox contents as a side effect of campaign cleanup — data we did not author and cannot restore. |
+| `EmailMessage.scheduledEmailId → ScheduledEmail` | **SetNull** | Same: purging send records must not delete stored mail. |
+| `EmailThread.leadId / campaignId / campaignLeadId` | **SetNull** | Attribution is an annotation on a thread, not its reason for existing. Most threads in a real mailbox have nothing to do with a campaign. Cascade would delete genuine conversations when their attribution target is removed. |
+| `EmailThread.emailAccountId → EmailAccount` | **Cascade** | A thread genuinely cannot exist without the mailbox that holds it — the row models "this mailbox's view of this conversation". Safe **only because `EmailAccount` is soft-deleted**: `deletedAt` is the normal disconnect path and this cascade is reachable only from a `MAINTENANCE` purge. See §7.2. |
+| `EmailMessage.threadId → EmailThread` | **Cascade** | A message with no thread is unreachable in the UI. Bounded by the same soft-delete gate. |
+| `ScheduledEmail.campaignId / campaignLeadId / leadId` | **Cascade** | A pending send for a deleted campaign is an instruction to email someone on behalf of something that no longer exists. Cascading is *safer than keeping it*: the alternative is an orphaned row that could still be claimed and sent. `EmailEvent` already holds the history, so nothing is lost. |
+| `ScheduledEmail.sequenceStepId / variantId / threadId` | **SetNull** | A **sent** row must survive editing the step or variant it came from. Cascade would delete sent history on an ordinary sequence edit. |
+| `Job.scheduledEmailId → ScheduledEmail` | **Cascade** | Cancelling a send must cancel its job. An orphaned `SEND_SCHEDULED_EMAIL` job whose target vanished is a worker crash at best. |
+| `Job.workspaceId → Workspace` | **Cascade** | Non-null and cascading: purging a tenant must not leave executable work behind that would act on their behalf. |
+| `Session.userId → User` | **Cascade** | Deleting a user must invalidate every session immediately. `SetNull` would leave an authenticated session with no identity — a live credential pointing at nothing. |
+| `Session.activeWorkspaceId → Workspace` | **SetNull** | Losing a workspace must not log the user out of their other workspaces. |
+| `AuditLog.workspaceId / actorUserId` | **SetNull** | An append-only security log that a deletion can erase is not a security log. Both nullable specifically so the row can outlive both subjects. |
+| `Activity.actorUserId`, `Note.authorUserId`, `Task.assigneeUserId` | **SetNull** | Authorship survives the author leaving; the note keeps its body. This is why `User` is soft-deleted rather than hard-deleted. |
+| `WorkspaceMember.userId / workspaceId` | **Cascade** | A membership without either side is meaningless. This is the intended way to remove access. |
+| `Opportunity.leadId → Lead` | **Cascade**, required | A deal is about a specific person; there is no such thing as an ownerless deal. |
+| `Opportunity.campaignId / campaignLeadId / threadId` | **SetNull** | Attribution again — the deal survives losing its provenance, with `value` and `stage` intact. Cascade here would **delete won revenue records** when someone tidies up an old campaign. |
+| `Task.opportunityId`, `Note.opportunityId` | **Cascade** | Scoped entirely to the deal. |
+| `AIAnalysis.*` (all five targets) | **Cascade** | An inference about a deleted message is unreadable and cannot be re-derived. It is a cache of a judgment, not a fact worth orphaning. |
+| `TrackingLink.scheduledEmailId` | **no FK at all** | Deliberate. Kept as a plain column so a click on an old link still resolves to a `302` instead of a `404` in a recipient's browser after the send is purged. An FK with either behaviour would break that. |
+| `Suppression.sourceCampaignId / sourceLeadId / sourceMessageId` | **no FK** | An imported suppression has no provenance rows to point at, and a suppression must **never** be deleted by a cascade from anywhere. Someone who unsubscribed stays unsubscribed even if the campaign, lead, and message are all gone. Making these real FKs would create paths to delete a legal obligation. |
+| `CampaignLead.assignedEmailAccountId` | **no FK** | The mailbox assignment is frozen history for the enrollment; it must not change or vanish when mailboxes are reorganised. |
+| `WebhookEvent.workspaceId` | **Cascade** (nullable) | Raw payloads are pruned with their tenant. |
+| `WebhookEvent.emailAccountId` | **SetNull** | An `UNMATCHED` payload keeps its forensic value without a mailbox. |
+
+### 7.2 Cascades I consider risky
+
+Honest list. Each is currently correct, and each depends on a guard that is
+**not itself enforced by the database**.
+
+**1. `Workspace` → 40 tables (`Cascade`).** A single `DELETE FROM "Workspace"
+WHERE id = $1` destroys the tenant's entire history: every lead, thread,
+message, event, opportunity, and audit log. `Workspace.deletedAt` exists to make
+this a two-phase operation — mark, then let a `MAINTENANCE` job purge after a
+retention window. **The risk is that nothing in the database prevents a direct
+hard delete.** A mis-scoped admin script or a `prisma migrate reset` pointed at
+the wrong `DATABASE_URL` reaches it in one statement. Mitigations: no service
+function issues an unqualified workspace delete; the purge job requires the row
+to be `deletedAt`-marked and older than the retention window; and production
+credentials are separate from local ones.
+
+**2. `EmailAccount` → `EmailThread` → `EmailMessage` (`Cascade`, `Cascade`).**
+Two hops from "disconnect a mailbox" to "delete the customer's stored mail". The
+guard is that disconnecting sets `status = DISCONNECTED`, and removing sets
+`deletedAt` — the hard delete is reachable only from a purge. **If a future
+"remove mailbox" feature ever calls `prisma.emailAccount.delete()` instead of
+setting `deletedAt`, it silently destroys every thread and message in that
+mailbox**, plus (via `Cascade`) every pending `ScheduledEmail`. `EmailEvent`
+survives because those FKs are `SetNull`, so analytics would remain while the
+mail itself was gone — a confusing and unrecoverable state. This is the cascade
+I would most want a database-level guard on, and there is not one today.
+
+**3. `Lead` → `CampaignLead`, `Task`, `Note`, `Activity`, `Opportunity`
+(`Cascade`).** GDPR erasure needs to work, so this chain is correct by intent —
+but a hard `Lead` delete also removes **the notes a salesperson wrote, their
+tasks, and any open deal**, none of which look like "personal data the lead asked
+us to erase" to the human clicking the button. `Lead.deletedAt` is why the
+default UI path never reaches the cascade. The residual risk is a bulk-delete
+action that hard-deletes for "cleanliness". Note the asymmetry that makes this
+survivable: `EmailThread.leadId` and `EmailEvent.leadId` are `SetNull`, so
+erasing a lead does not erase the mail or the metrics — which is the correct
+GDPR outcome anyway, since those are records of a real correspondence.
+
+**4. `Campaign` → `ScheduledEmail` → `Job` (`Cascade`, `Cascade`).** Correct and
+desirable: deleting a campaign must not leave sendable work behind. Worth naming
+because it is the one cascade that is *load-bearing for safety* rather than
+merely tidy. The complementary risk is the opposite mistake: if
+`ScheduledEmail.campaignId` were ever changed to `SetNull`, orphaned rows could
+still be claimed by a worker and **sent on behalf of a campaign that no longer
+exists.**
+
+**5. `AIAnalysis` → 5 parents (`Cascade`).** Low stakes but easy to get wrong in
+the other direction: `humanCorrection` is a human's labelled training signal,
+and cascading deletes it. Acceptable because the correction is meaningless
+without the message it labels, but if we ever export corrections as a training
+set, that export has to happen before the purge.
+
+### 7.3 Soft delete, and what it costs
+
+Six models carry `deletedAt`: `User`, `Workspace`, `EmailAccount`, `Lead`,
+`LeadList`, `Campaign` — chosen because each is either referenced by history we
+must retain or is a cascade root.
+
+**The known sharp edge.** All four soft-deleted tenant models also carry a
+`@@unique` on a mutable natural key:
+
+```prisma
+Lead          @@unique([workspaceId, email])
+EmailAccount  @@unique([workspaceId, email])
+Campaign      @@unique([workspaceId, name])
+LeadList      @@unique([workspaceId, name])
+```
+
+Postgres unique indexes **do not know about `deletedAt`**. So after
+soft-deleting a lead, re-importing the same address fails with `23505` even
+though the UI shows no such lead. The behaviour is consistent, not random — but
+it must be a deliberate product decision, and the service layer has to own it:
+
+- **`Lead`:** the import path should **undelete-and-update** on conflict
+  (`ON CONFLICT (workspaceId, email) DO UPDATE SET "deletedAt" = NULL, …`).
+  This is the right behaviour anyway — re-importing a lead you deleted should
+  restore them, not error.
+- **`Campaign` / `LeadList` / `EmailAccount`:** surface a clear error naming the
+  soft-deleted row and offer to restore it. Never silently rename.
+
+The alternative — a partial unique index `WHERE "deletedAt" IS NULL` — permits
+unlimited deleted rows sharing an email, which then makes *undelete* ambiguous
+and lets `Lead` accumulate duplicate history for one person. We chose the
+constraint that keeps one row per address forever, and pay for it with an
+explicit conflict path.
+
+---
+
+## 8. Reply attribution
+
+Turning "a message appeared in a mailbox" into "lead L replied to step 3 of
+campaign C, so stop the sequence" is the hardest correctness problem in the
+product. It is also the one place where being wrong is *visible to a customer's
+prospect*: a missed reply means we keep emailing someone who already answered.
+
+### 8.1 How headers map onto the schema
+
+| RFC 5322 / provider concept | Column | Notes |
+|---|---|---|
+| Gmail `threadId` | `EmailThread.providerThreadId` | **The primary association key.** Gmail's own threading is better than anything we would reimplement. |
+| Conversation root `Message-ID` | `EmailThread.rootMessageId` | Fallback for providers with no thread id: `References[0]`, or the first message's own `Message-ID`. |
+| Subject, prefixes stripped | `EmailThread.normalizedSubject` | `Re:`/`Fwd:`/`AW:`/`RE :` removed, whitespace collapsed. **Last-resort** signal. |
+| `Message-ID` | `EmailMessage.rfcMessageId` | Angle brackets stripped, lowercased. The portable identity across mailboxes and providers. |
+| `In-Reply-To` | `EmailMessage.inReplyTo` | Single value, normalised. When a client sends several we keep the **last**, which is the immediate parent. |
+| `References` | `EmailMessage.references String[]` | Full chain, oldest first, **as an array** so a reply can be matched against *any* Message-ID we sent via array overlap. |
+| Gmail `messages.id` | `EmailMessage.providerMessageId` | Sync idempotency key (§5.8). |
+| Gmail `internalDate` | `EmailMessage.sentAt` | **Not** the `Date` header, which senders routinely get wrong or backdate. |
+| `Auto-Submitted`, `X-Autoreply`, `Precedence`, `List-Unsubscribe`, `Return-Path`, `Authentication-Results` | `EmailMessage.headers Json?` | Only the load-bearing ones. The full block is large and mostly noise. |
+| DSN status code | `EmailMessage.bounceCode` (`"5.1.1"`), `bounceType` | |
+| Address that actually bounced | `EmailMessage.bouncedRecipient` | From the DSN **body**, not the DSN's `From` (which is `mailer-daemon`). |
+
+**On our own outbound side**, `ScheduledEmail` carries the sending half:
+`rfcMessageId` — **generated by us before the send**, which is what makes
+attribution work even when the provider response is lost — plus
+`inReplyToMessageId` and `referencesHeader` for follow-ups, and
+`providerThreadId` after the send.
+
+`Campaign.threadFollowUps` (default true) makes follow-ups reply into step 1's
+thread. It lifts reply rates, and the tradeoff is stated in the schema: one bad
+thread taints the follow-ups.
+
+### 8.2 The attribution ladder
+
+An inbound message is attributed by trying signals in descending order of
+reliability, stopping at the first hit. Cheap and exact first; fuzzy and
+last-resort last.
+
+```
+inbound EmailMessage (direction = INBOUND)
+  │
+  ├─1─ providerThreadId matches an EmailThread for this mailbox?
+  │      → EmailThread_emailAccountId_providerThreadId_key
+  │      → thread.campaignLeadId is already set. DONE. (the overwhelming majority)
+  │
+  ├─2─ inReplyTo equals a ScheduledEmail.rfcMessageId we sent?
+  │      → ScheduledEmail_rfcMessageId_idx  → campaignLeadId. EXACT.
+  │
+  ├─3─ references[] overlaps ANY rfcMessageId we sent?
+  │      → GIN index on references (§6.2)
+  │      → survives clients that truncate or reorder the chain.
+  │
+  ├─4─ fromEmail (normalised, plus-addressing stripped) matches a Lead
+  │      with an ACTIVE/WAITING CampaignLead in this mailbox?
+  │      → Lead_workspaceId_email_key + CampaignLead_leadId_state_idx
+  │      → ambiguous if several; prefer the most recent lastSentAt.
+  │
+  ├─5─ normalizedSubject matches a thread we started, same participant domain?
+  │      → EmailThread_workspaceId_normalizedSubject_idx.  WEAK.
+  │
+  └─6─ no match → leave campaignLeadId NULL. It is ordinary mail.
+        The inbox still shows it. We do NOT guess.
+```
+
+Steps 1–3 are exact identifier matches and carry no false-positive risk. Step 4
+is a heuristic. Step 5 is weak enough that it should only ever *stop* a
+sequence when combined with a `HUMAN_REPLY` classification and a matching
+participant domain. **Step 6 is a real outcome, not a failure** — most mail in a
+connected mailbox has nothing to do with outreach, and inventing an attribution
+is worse than admitting we do not have one.
+
+Once attributed **and** classified `HUMAN_REPLY`, one transaction:
+
+```sql
+-- Idempotent: the WHERE clause makes a redelivered webhook a no-op.
+UPDATE "CampaignLead"
+   SET state = 'REPLIED', "stopReason" = 'HUMAN_REPLY',
+       "stoppedAt" = now(), "nextStepAt" = NULL, "currentStepId" = NULL,
+       "replyCount" = "replyCount" + 1, "lastRepliedAt" = now()
+ WHERE id = $1
+   AND state IN ('PENDING', 'ACTIVE', 'WAITING', 'PAUSED');
+
+UPDATE "ScheduledEmail"
+   SET state = 'CANCELLED', "cancelledAt" = now(),
+       "cancelledReason" = 'HUMAN_REPLY'
+ WHERE "campaignLeadId" = $1
+   AND state = 'SCHEDULED';        -- SENDING is never cancelled: it may be in flight
+
+UPDATE "EmailThread"
+   SET "hasHumanReply" = true, "firstReplyAt" = COALESCE("firstReplyAt", $2)
+ WHERE id = $3;
+
+-- append-only
+INSERT INTO "EmailEvent" (...) VALUES (... 'REPLIED' ...);
+```
+
+Nulling `nextStepAt` is what removes the row from
+`CampaignLead_state_nextStepAt_idx` — the scheduler stops considering it because
+it is no longer in the index, not because of a flag someone remembered to check.
+
+### 8.3 The messy cases, honestly
+
+**Auto-replies and out-of-office.** These arrive on the right thread with the
+right `In-Reply-To`, so steps 1 and 2 attribute them perfectly — and then
+stopping the sequence would be **wrong**. Someone on holiday has not replied.
+This is why attribution and classification are **separate**: `campaignLeadId`
+gets set, `classification` becomes `OUT_OF_OFFICE` or `AUTO_REPLY`, and only
+`HUMAN_REPLY` stops the sequence. Detection is deterministic first, from the
+headers we deliberately keep: `Auto-Submitted: auto-replied` (RFC 3834),
+`X-Autoreply`, `Precedence: bulk|auto_reply`. Body-pattern matching runs after
+headers and is the weaker signal, because it is language-dependent — an OOO in
+Japanese matches no English pattern list, which is exactly the case where the AI
+classifier earns its place. What we do **not** do is treat an OOO as engagement;
+it is not an open, not a reply, and not a signal about the lead's interest.
+
+Two known imperfections we accept: a human who replies *inside* an OOO-flagged
+message (some clients set `Precedence: bulk` on everything) is initially
+misclassified, and `AIAnalysis.humanCorrection` is the repair path. And an OOO
+with a genuine "contact my colleague at X" is useful information that we
+currently do nothing with.
+
+**Mailer-daemon bounces.** The DSN arrives `From: mailer-daemon@...`, which
+matches no lead — step 4 finds nothing, and *that is the point*. Attribution
+comes from inside the DSN: the RFC 3464 `message/delivery-status` part names the
+original recipient and the original `Message-ID`. `bouncedRecipient` stores the
+address from the **body**, never the envelope `From`; that distinction is the
+whole trick. `bounceCode` drives `BounceType`: `5.x.x → HARD` (suppress
+permanently, `Suppression` with `HARD_BOUNCE`), `4.x.x → SOFT` (retry, count
+toward `SOFT_BOUNCE_LIMIT`), policy blocks → `BLOCKED`, which raises a
+deliverability alert and **does not suppress the address** — the problem is our
+reputation, not their mailbox. Unparseable DSNs become `UNKNOWN` rather than
+being guessed into `HARD`, because a wrong `HARD` permanently destroys a good
+address on a customer's list.
+
+**Forwarded threads.** A prospect forwards our email to a colleague, who replies
+from a different address on a chain that has been reordered and truncated. Step
+1 fails (new provider thread), step 2 usually fails (`In-Reply-To` points at the
+forward, not at us), **step 3 is what saves it** — the `References` array still
+overlaps one of our sent `Message-ID`s, and the GIN index answers that in one
+lookup. This is the entire reason `references` is an array column and not a
+concatenated string: a `LIKE '%<id>%'` over a text field cannot be indexed
+usefully and matches substrings it should not. The colleague's address is not the
+lead's, so the reply attributes to the right `CampaignLead` while
+`fromEmail` differs — correct, and worth surfacing in the UI rather than
+hiding.
+
+**Aliases and plus-addressing.** A lead mailed at `sales@acme.com` replies as
+`john.smith@acme.com`; or we mail `john+outreach@acme.com` and they reply from
+`john@acme.com`. Normalisation is deliberate and asymmetric: **plus-addressing
+is stripped** (which is why `Suppression.value` strips it too — unsubscribing
+`a+news@x.com` must also suppress `a@x.com`, or an unsubscribe is trivially
+defeated), while `Lead.emailRaw` keeps the original so support can answer "what
+did I upload?". Dots are **not** normalised: `john.smith@` and `johnsmith@` are
+the same Gmail mailbox but different addresses at most other providers, and
+guessing wrong merges two real people. Alias-to-canonical mapping is not
+modelled (§10) — steps 1–3 usually make it unnecessary, since an alias reply
+still lands on the same provider thread.
+
+**A reply from a different address than the one we mailed.** The general case of
+the two above, and the reason the ladder is ordered as it is: **thread and header
+identity beat address identity.** Step 4 exists only for the case where all
+identifier evidence is gone — a recipient composing a fresh email to us rather
+than replying. It is a heuristic, it is ambiguous when a lead is enrolled in
+several campaigns, and the tiebreak (most recent `lastSentAt`) can be wrong. It
+is bounded by requiring an `ACTIVE`/`WAITING` enrollment: a lead who already
+replied cannot be attributed again by address alone.
+
+**Two mailboxes, one conversation.** If two connected mailboxes are both on a
+thread, that is **two `EmailThread` rows** — `@@unique([emailAccountId,
+providerThreadId])` guarantees it, and merging them would be wrong because each
+mailbox has its own read state and its own provider ids. The consequence to
+handle in code: the same reply is processed twice, once per mailbox. The
+`CampaignLead` update is idempotent (its `WHERE state IN (…)` matches nothing the
+second time) and `EmailEvent.dedupeKey` prevents the double count. **The
+invariant holds because of §5, not because of §8.**
+
+**Ordering.** Inbound processing is a job, and jobs are at-least-once and not
+strictly ordered. A reply can be processed *before* the `SENT` bookkeeping for
+the message it answers — sync latency is not correlated with our own write
+order. Nothing in the reply path may assume the outbound row is already in its
+final state; that is why attribution matches on `rfcMessageId`, which we
+generated **before** the send, rather than on `providerMessageId`, which only
+exists afterwards.
+
+---
+
+## 9. Migrations and seed
+
+### 9.1 Forward-only, committed migrations
+
+Migrations live in `prisma/migrations/`, are **committed**, and are
+**forward-only**. There is no `down` migration and we do not write one: a
+rollback script is tested exactly never, and the one time it runs is the one time
+production is already broken. Recovery from a bad migration is a **new
+migration** that moves forward, plus a point-in-time restore if data was lost.
+
+| Environment | How schema arrives |
+|---|---|
+| Local dev | `prisma migrate dev` — authors the migration and applies it |
+| Test | `prisma migrate reset --force --skip-seed` — from scratch, every run |
+| Production | `prisma migrate deploy` — applies committed migrations, authors nothing |
+
+Rules:
+
+- **Never `migrate reset` outside local/test.** It drops the database.
+- **Never hand-edit an applied migration.** Its checksum is recorded; editing it
+  makes `migrate status` report drift forever.
+- **Do hand-edit a *new* migration** to add what Prisma cannot express — the
+  partial indexes, GIN indexes, and `REVOKE`s in §6.2 are added exactly this
+  way, then committed as part of that migration.
+- **`migrate deploy` needs an unpooled connection.** `DIRECT_DATABASE_URL` is
+  preferred by `prisma.config.ts` for this reason: migrations must not run
+  through a transaction-mode pooler, which breaks advisory locks and session
+  state. Locally the two URLs are the same.
+- **Review every migration for locks.** On PostgreSQL 16, adding a nullable
+  column or a column with a non-volatile default is metadata-only and cheap.
+  These are not: `SET NOT NULL` on a populated table, adding a `CHECK` or FK
+  without `NOT VALID`, and rewriting a type. Create indexes on large tables with
+  `CREATE INDEX CONCURRENTLY` in a migration marked to run outside a transaction.
+- Verify non-destructively before applying anything (from
+  `INTEGRATION-NOTES.md` §9 — Prisma 7's agent guardrail blocks `db push`, and
+  we work with it rather than around it):
+
+```bash
+# read-only: touches no database
+bunx prisma migrate diff --from-empty --to-schema prisma/schema.prisma \
+    --script > /tmp/schema.sql
+
+# apply to a brand-new empty database, so there is nothing to lose
+createdb ddl_probe && psql -d ddl_probe -v ON_ERROR_STOP=1 -f /tmp/schema.sql
+```
+
+Never point a destructive command at `instantmail`, and never pass
+`PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` on the user's behalf.
+
+### 9.2 Expand-contract for destructive changes
+
+Any change that could lose data or break a running deployment is **three
+migrations across at least two releases**, never one. The reason is that during a
+rolling deploy, old and new application code run **simultaneously** against one
+database — so the schema must satisfy both.
+
+```
+Renaming Lead.jobTitle → Lead.title
+
+  EXPAND    migration 1   add "title" (nullable). Deploy code that WRITES BOTH
+            release N     and READS "title" ?? "jobTitle".
+                          Old pods still write jobTitle only. Both work.
+
+  MIGRATE   migration 2   UPDATE "Lead" SET title = "jobTitle" WHERE title IS NULL;
+            release N     backfill in batches, not one statement over 5M rows.
+
+  CONTRACT  migration 3   drop "jobTitle". ONLY once no running code reads it.
+            release N+1
+```
+
+The rule, stated plainly: **a single migration may never both add the new shape
+and remove the old one.** Applies to renaming or dropping a column, narrowing a
+type, adding `NOT NULL`, splitting a table, and changing a unique constraint.
+
+Enum members are the common trap. **Adding** a member is safe (`ALTER TYPE …
+ADD VALUE`, though it cannot run inside a transaction with other statements on
+some paths). **Removing** one requires expand-contract: migrate every row off the
+value, deploy code that no longer produces it, *then* drop it. Given that all 35
+enums here back state machines, a dropped member is a row whose state cannot be
+read — and `EmailEvent` and `AuditLog` are append-only, so historical rows
+holding a retired value cannot be rewritten at all. In practice: **prefer adding
+a member and deprecating the old one in code.**
+
+### 9.3 Test database reset
+
+Integration tests run against **real Postgres, real Prisma, real SQL** —
+`instantmail_test` on the user-space cluster (port 5433), which
+`scripts/db.sh init` already creates alongside `instantmail`. **Prisma is never
+mocked here**; mocking the thing under test would leave us testing our mock's
+opinion of `SKIP LOCKED`.
+
+**The schema is created once per run** by `prisma migrate reset --force
+--skip-seed`, which doubles as the assertion that migrations apply from scratch.
+
+**Between tests: truncate, not transaction rollback.** Rollback isolation is
+faster and tempting, and it cannot test the things that matter most here:
+
+- The queue's correctness depends on `SELECT … FOR UPDATE SKIP LOCKED` **across
+  two concurrent connections**. Inside one wrapping transaction there is one
+  connection, so the entire lease mechanism is untestable.
+- Repos use `prisma.$transaction` internally. Nesting real transactions inside a
+  wrapper turns them into savepoints, which have different visibility and
+  locking behaviour.
+- `ON CONFLICT` and unique-violation paths behave differently mid-transaction —
+  and §5 is *entirely* about unique-violation paths.
+
+```ts
+// tests/integration/setup.ts
+/** Every table except Prisma's own bookkeeping, discovered at runtime so a new
+ *  table is covered automatically — a hand-maintained list rots silently. */
+async function truncateAll() {
+  const rows = await prisma.$queryRaw<{ tablename: string }[]>`
+    SELECT tablename FROM pg_tables
+     WHERE schemaname = 'public' AND tablename NOT LIKE '\_prisma%'`;
+  if (rows.length === 0) return;
+  const list = rows.map((r) => `"public"."${r.tablename}"`).join(', ');
+  // One statement: RESTART IDENTITY resets sequences, CASCADE ignores FK order.
+  await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);
+}
+
+beforeEach(truncateAll);
+```
+
+`RESTART IDENTITY` matters because `EmailEvent`, `Activity`, `AuditLog`, and
+`Job` use `BigInt @default(autoincrement())`, and a test asserting on ids should
+not depend on how many tests ran before it. `CASCADE` removes any need to order
+42 tables by FK dependency. On a nearly-empty schema this is single-digit
+milliseconds, so the speed argument for rollback does not survive contact with
+our table sizes.
+
+Integration tests run **serially** — they share one database. The deliberate
+exception is the concurrent-lease test, which spawns its own connections on
+purpose, because that is the only way to test §5.5 and §6.3 at all.
+
+No global "seed the world" fixture: it becomes a hidden dependency every test
+relies on and nobody dares change. Composable factories create the minimum and
+return typed rows.
+
+### 9.4 What `prisma/seed.ts` creates
+
+Run by `bun run db:seed`, wired through `prisma.config.ts`
+(`migrations.seed`). Purpose: **the app is demoable immediately after
+`db:migrate && db:seed`** — every page has real content, and no page shows an
+empty state on a fresh clone. Idempotent (upsert on the natural keys from §3), so
+re-running is safe.
+
+| Rows | Detail |
+|---|---|
+| 1 `Workspace` | `slug: "acme"`, `timezone: "Europe/Berlin"` — a non-UTC zone deliberately, so window and daily-cap bugs surface locally instead of in production |
+| 1 `User` + 1 `WorkspaceMember` | `owner@acme.test`, argon2id hash of a known dev password, `role: OWNER` |
+| 1 `Domain` | `acme.test`, `spfStatus: PASS`, `dkimStatus: PASS`, `dmarcStatus: WARN` — a mixed verdict so the deliverability page shows all three states, not a row of green |
+| 1 `EmailAccount` | `outreach@acme.test`, `provider: GMAIL`, `status: ACTIVE`, `dailySendLimit: 50`, linked to the domain. **No real OAuth token** — `encryptedRefreshToken` is null and sending is not attempted |
+| 3 `CustomFieldDefinition` | `industry` (SELECT), `employees` (NUMBER), `renewalDate` (DATE) — so personalisation and the lead detail panel have something to render |
+| 4 `LeadTag`, 2 `LeadList` | tags across `colorToken` values; lists "Q3 Prospects" and "Conference Leads" |
+| ~25 `Lead` | Mixed `status` (`NEW`, `CONTACTED`, `ENGAGED`, `REPLIED`, `BOUNCED`), populated `customFields`, varied `score`, spread across list memberships and tags |
+| 1 `Campaign` + 1 `Sequence` | `status: ACTIVE`, `threadFollowUps: true`, one `CampaignMailbox`, one `CampaignLeadListSource` |
+| 4 `SequenceStep` | `EMAIL` (pos 1, delay 0) → `WAIT` (pos 2, 4320 = 3 days) → `EMAIL` (pos 3) → `CONDITION` (pos 4, `HAS_REPLIED`, outcome `STOP`). Exercises all three step types |
+| 5 `SequenceStepVariant` | Step 1 has **A and B** so the A/B UI and one `Experiment` + 2 `ExperimentArm` have data |
+| ~15 `CampaignLead` | Across `PENDING`, `ACTIVE`, `WAITING`, `COMPLETED`, `REPLIED`, `BOUNCED` — so the enrollment table shows every state |
+| `ScheduledEmail` | A few `SENT`, one `SCHEDULED` in the near future, one `CANCELLED` with `cancelledReason: HUMAN_REPLY` |
+| `EmailThread` + `EmailMessage` | 6 threads with realistic `OUTBOUND`/`INBOUND` pairs and correct `rfcMessageId`/`inReplyTo`/`references` chains, including **one `OUT_OF_OFFICE` and one `BOUNCE`** so the inbox demonstrates that not every reply stops a sequence |
+| `EmailEvent` | `QUEUED`/`SENT`/`OPENED`/`CLICKED`/`REPLIED`/`BOUNCED` back-dated across ~14 days with `isFirstForSend` set correctly, so analytics charts have a real time series rather than one spike |
+| `MailboxDailyStat` | 14 days of counters for the mailbox |
+| 2 `Opportunity`, 3 `Task`, 2 `Note` | Opportunities in `QUALIFYING` and `MEETING_BOOKED` with `Decimal` values; tasks across `OPEN`/`IN_PROGRESS`, one overdue |
+| `Activity` | Timeline entries matching the above, so a lead page reads as a coherent history |
+| 2 `Suppression` | one `UNSUBSCRIBED` (EMAIL scope), one `POLICY` (DOMAIN scope) |
+| 1 `AIAnalysis` | A `REPLY_CLASSIFICATION` with `model`, `promptVersion`, `confidence`, and a `summary`, attributed as AI-generated |
+
+Deliberately **not** seeded: `Job` rows (the worker would immediately try to
+send), real OAuth tokens or any encrypted credential, `AuditLog` (it is
+append-only and earns its rows from real actions), and `WebhookEvent`.
+
+**Counters are seeded consistently with the events**, because inconsistent seed
+data teaches developers to distrust the dashboard — and since `EmailEvent` is the
+truth and `*Count` columns are caches, the seed must satisfy the same invariant
+the rollup job does. `bun run db:seed` after a reset should leave
+`ROLLUP_ANALYTICS` with nothing to change.
+
+---
+
+## 10. What we deliberately did not model yet
+
+Being explicit about deferred scope, and about **when it stops being cheap**. The
+distinction that matters: adding a **nullable column or a new table** is cheap
+forever. Adding a **`NOT NULL` column, changing a unique constraint, or splitting
+an existing table** gets expensive the moment real data exists, because it turns
+into an expand-contract sequence with a backfill (§9.2).
+
+### Cheap to add later — no backfill, no expand-contract
+
+| Deferred | Why deferred | What it would take |
+|---|---|---|
+| **Billing / plans / usage metering** | Phase 11. No pricing model is decided, and guessing produces a schema shaped like the wrong business. | New tables (`Plan`, `Subscription`, `UsageRecord`) hanging off `Workspace`. `Workspace.planId` nullable. Metering reads `EmailEvent`, which already holds the volume facts. **Cheap indefinitely** — it is additive. |
+| **Saved filters / dynamic segments** | `LeadList` is deliberately **static**. Mixing static membership and dynamic predicates in one table produced two mutually incompatible semantics: does removing a lead from a dynamic list edit the lead or the filter? | A new `SavedFilter` table holding a validated predicate JSON, plus letting `CampaignLeadListSource` reference either. `LeadList` does not change. |
+| **Sequence templates** | `Sequence` is already 1:1 with `Campaign` **specifically so** a reusable template is a plausible near-term extension rather than a refactor. | A `SequenceTemplate` + `SequenceTemplateStep` pair, and a copy-on-use service. No change to `Sequence`. |
+| **Outlook / SMTP sending** | Phase 11. `EmailProvider` already has `OUTLOOK` and `SMTP`; `EmailAccount` already carries `smtpHost`/`smtpPort`/`encryptedSmtpPassword`/`imapHost`/`imapPort`; `SyncState.deltaToken` is already there for Graph. | A provider adapter, not a migration. **The schema is already ready.** |
+| **Team/lead assignment rules, round-robin** | No customer has asked. | A rules table; `Lead.ownerUserId` already exists as the target. |
+| **Webhooks out / public API** | Phase 11. | `ApiKey` and `OutboundWebhook` tables. Additive. |
+| **Email verification provider** | `Lead.verificationStatus` and `verifiedAt` already exist and default to `UNVERIFIED`. | Wire a provider and a job type. No migration. |
+| **Attachment storage** | We store attachment **metadata** and fetch bytes on demand. Storing bytes needs an object store and a retention policy we have not decided. | A blob reference column on the existing `attachments` JSON. Cheap. |
+
+### Gets expensive once data exists
+
+| Deferred | Why deferred | What it would cost later |
+|---|---|---|
+| **Soft-delete everywhere** | Only 6 models carry `deletedAt` — the cascade roots and the models referenced by retained history. Adding it to all 42 would mean **every query in the codebase needs a `deletedAt: null` filter**, and the one that forgets silently leaks deleted rows. That is a large, permanent correctness tax paid for a benefit we do not currently need. | The column is cheap; the **query audit is not**. Retrofitting means touching every repo function and re-verifying workspace isolation on each. Do it per-model, when a specific model demonstrates a need — not as a sweep. |
+| **Warmup depth** (real inbox placement, spam-folder rescue, third-party pools) | `WarmupPool`/`WarmupPoolMember` model the *configuration* and the ramp, not the mechanics. Genuine warmup needs IMAP folder inspection to know whether mail landed in spam, and mailbox-to-mailbox traffic between *our own* accounts proves little about placement at Gmail. Modelling more without the ability to observe placement would be **fake functionality** (§8 of the brief). | Mostly new tables (`WarmupSend`, placement results). Moderate. The honest constraint is that we cannot report placement we cannot observe, which is a product limit, not a schema one. |
+| **Multi-region / sharding** | Locked: single primary, no sharding. Cross-region replication changes the consistency model the queue depends on — `SELECT … FOR UPDATE SKIP LOCKED` requires a single writer, and `EmailEvent` ordering assumptions break under multi-master. | **Expensive.** Every `cuid` primary key would need region encoding or a switch to something like a snowflake id; the queue would need per-region partitioning. This is the one item on the list that is genuinely hard after data exists, which is why the single-primary decision is locked rather than assumed. |
+| **Per-recipient timezone-aware sending** | `Lead.timezone` exists but is **often null** — we do not guess aggressively, and the campaign timezone is the fallback. Sending in each recipient's local morning needs reliable geo/timezone inference we do not have. | Cheap schema-wise (the column exists), but the scheduler's window logic gets materially harder: one campaign then has N windows, and the daily-cap arithmetic per mailbox no longer aligns with one local day. |
+| **Alias / canonical address mapping** | Steps 1–3 of the attribution ladder (§8.2) usually make it unnecessary, since an alias reply still lands on the same provider thread. | A `LeadEmailAlias` table, plus widening the address-match step. Moderate, and it would need care not to weaken `Lead`'s dedup key. |
+| **Full-text search over message bodies** | The inbox currently searches subject and participants via btree and GIN. Real body search needs `tsvector` columns with triggers, or an external index. | A generated `tsvector` column plus a GIN index on `EmailMessage` — a **rewrite of the largest-but-one table in the system**. Cheap now, an hours-long lock later. If we want it, add the column early even if unused. |
+| **Event partitioning on `EmailEvent`** | `EmailEvent` is append-only, time-ordered, and unbounded — the textbook partitioning candidate. Not done because partitioning an empty table is speculative and Prisma does not manage partitions. | Declarative range partitioning by `occurredAt` must be set up **before** the table is large, or it means a full copy under load. **This is the one deferred item with a real deadline.** Cheap today; expensive at scale. Revisit when the table passes ~50M rows or when a rollup exceeds its window. |
+
+### Two things that are not deferred, but bear repeating
+
+- **`DELIVERED` events are mostly absent for Gmail.** The Gmail API does not tell
+  us. The enum member exists for providers that do. It must not be surfaced as a
+  metric we have for every send — that would be reporting a number we do not
+  have.
+- **Inbox-vs-spam placement is not modelled at all**, because we cannot observe
+  it. No column, no score, no estimate. Any vendor claiming otherwise from
+  sender-side data is guessing, and a guess in a deliverability dashboard is
+  worse than an absence.

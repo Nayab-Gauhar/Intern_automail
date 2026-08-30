@@ -149,8 +149,11 @@ The generated DDL was applied to a scratch database with `ON_ERROR_STOP=1` and s
 
 Tenancy audit: of 42 models, **only 4 lack `workspaceId`** — `User`, `Session`,
 `PasswordResetToken` (identity-scoped, not tenant-owned) and `Workspace` (the tenant root).
-Every tenant-owned model is scoped. All 134 FK-owning relations declare an explicit
+Every tenant-owned model is scoped. All **123** FK-owning relations declare an explicit
 `onDelete` (81 `Cascade`, 42 `SetNull`), so no deletion behaviour is left to chance.
+(123, not 134: `grep -c '@relation'` counts *both* sides of every relation, while only
+the side carrying `fields:`/`references:` owns a foreign key. The generated DDL contains
+exactly 123 `FOREIGN KEY` clauses, and 81 + 42 = 123.)
 
 The product invariants are enforced **by the database**, not merely by application code:
 

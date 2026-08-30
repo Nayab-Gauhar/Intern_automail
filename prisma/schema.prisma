@@ -6,9 +6,10 @@
 //     an index. Unique constraints on tenant data are workspace-scoped, either
 //     directly (`@@unique([workspaceId, ...])`) or transitively through a
 //     leading column that is itself a workspace-scoped FK (e.g.
-//     `@@unique([campaignId, leadId])`). There are exactly three models with a
-//     nullable `workspaceId` (AuditLog, WebhookEvent, Job.workspaceId is NOT
-//     nullable) — see docs/architecture/01-database.md §3.
+//     `@@unique([campaignId, leadId])`). Exactly two models have a nullable
+//     `workspaceId` — AuditLog and WebhookEvent, both of which can record events
+//     that arrive before a workspace is known. Job.workspaceId is NOT nullable.
+//     See docs/architecture/01-database.md §3.
 //  2. TIME. Every timestamp is `@db.Timestamptz(6)`. Nothing stores local time.
 //     Local-calendar semantics (daily caps, sending windows) are derived from a
 //     stored IANA timezone string, never from a naive timestamp.
