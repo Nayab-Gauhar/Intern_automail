@@ -26,12 +26,13 @@
     "db:reset": "prisma migrate reset",
     "db:studio": "prisma studio",
     "db:seed": "bun run prisma/seed.ts",
-    "test": "bun test tests/unit",
-    "test:unit": "bun test tests/unit",
-    "test:integration": "bun test tests/integration",
+    "test": "bun test --conditions react-server tests/unit",
+    "test:unit": "bun test --conditions react-server tests/unit",
+    "test:integration": "bun test --conditions react-server tests/integration",
     "test:e2e": "playwright test",
     "check": "bun run typecheck && bun run lint && bun run test:unit",
-    "lint:fix": "eslint . --fix"
+    "lint:fix": "eslint . --fix",
+    "test:watch": "bun test --conditions react-server --watch tests/unit"
   },
   "prisma": {
     "seed": "bun run prisma/seed.ts"
