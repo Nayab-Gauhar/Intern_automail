@@ -105,3 +105,60 @@ config loading outright:
 
 `bunx tsc --noEmit` currently exits 2 with `TS18003: No inputs were found` — expected
 while no `.ts` files exist; it resolves as soon as source lands.
+
+## 8. Prisma 7 CLI flag changes (found by running them)
+
+| Prisma ≤6 | Prisma 7 | Symptom if you use the old form |
+|---|---|---|
+| `db push --skip-generate` | flag removed | CLI prints help and exits 0 — **a silent no-op** |
+| `migrate diff --to-schema-datamodel <p>` | `--to-schema <p>` | prints help, writes an empty script |
+
+The `--skip-generate` case is the dangerous one: the command appears to succeed while doing
+nothing. Any script using it needs updating.
+
+## 9. `prisma db push` refuses to run for an AI agent
+
+Prisma 7 ships an agent guardrail. `db push --accept-data-loss` returns a block explaining
+that the action irreversibly destroys all data and requires explicit user consent via
+`PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION`.
+
+This is a good default and we work with it rather than around it. To verify a schema
+**non-destructively**, generate the DDL and apply it to a throwaway database:
+
+```bash
+# read-only: touches no database
+bunx prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script > /tmp/schema.sql
+
+# apply to a brand-new empty database, so there is nothing to lose
+createdb ddl_probe && psql -d ddl_probe -v ON_ERROR_STOP=1 -f /tmp/schema.sql
+```
+
+Never pass the consent variable on the user's behalf, and never point a destructive command
+at `instantmail` (the dev database with real local state).
+
+## 10. Schema verified against live PostgreSQL 16 ✅
+
+The generated DDL was applied to a scratch database with `ON_ERROR_STOP=1` and succeeded:
+
+| Object | Count |
+|---|---|
+| Tables | 42 |
+| Enums | 35 |
+| Indexes | 222 |
+| Foreign keys | 123 |
+
+Tenancy audit: of 42 models, **only 4 lack `workspaceId`** — `User`, `Session`,
+`PasswordResetToken` (identity-scoped, not tenant-owned) and `Workspace` (the tenant root).
+Every tenant-owned model is scoped. All 134 FK-owning relations declare an explicit
+`onDelete` (81 `Cascade`, 42 `SetNull`), so no deletion behaviour is left to chance.
+
+The product invariants are enforced **by the database**, not merely by application code:
+
+```
+ScheduledEmail_campaignLeadId_sequenceStepId_key   one email per lead per step
+ScheduledEmail_dedupeKey_key                       survives worker crash / retry
+EmailEvent_dedupeKey_key                            webhook redelivery cannot double-count
+CampaignLead_campaignId_leadId_key                  no duplicate enrollment
+Job_state_runAt_priority_idx                        queue lease path
+Job_state_leaseExpiresAt_idx                        dead-worker job reclamation
+```

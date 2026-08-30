@@ -1,0 +1,2601 @@
+// Instant Mail — PostgreSQL 16 data model.
+//
+// Contract notes for every implementer touching this file:
+//
+//  1. TENANCY. Every tenant-owned model carries a non-null `workspaceId` with
+//     an index. Unique constraints on tenant data are workspace-scoped, either
+//     directly (`@@unique([workspaceId, ...])`) or transitively through a
+//     leading column that is itself a workspace-scoped FK (e.g.
+//     `@@unique([campaignId, leadId])`). There are exactly three models with a
+//     nullable `workspaceId` (AuditLog, WebhookEvent, Job.workspaceId is NOT
+//     nullable) — see docs/architecture/01-database.md §3.
+//  2. TIME. Every timestamp is `@db.Timestamptz(6)`. Nothing stores local time.
+//     Local-calendar semantics (daily caps, sending windows) are derived from a
+//     stored IANA timezone string, never from a naive timestamp.
+//  3. INDEXES ON FOREIGN KEYS. Prisma Migrate does NOT create indexes for
+//     foreign keys on PostgreSQL. Every FK that is filtered or joined on has an
+//     explicit `@@index`. Do not delete them because they "look redundant".
+//  4. PARTIAL / GIN INDEXES cannot be expressed in Prisma schema language. They
+//     live in hand-edited migration SQL and are listed in the database doc.
+//     They are load-bearing for the queue and scheduler hot paths.
+//  5. COUNTERS ARE CACHES. `EmailEvent` is the append-only source of truth for
+//     analytics. Any `*Count` column on a parent row is a denormalised cache and
+//     may be rebuilt from EmailEvent at any time.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = []
+}
+
+datasource db {
+  provider = "postgresql"
+
+  // Prisma 7 removed `url` and `directUrl` from this block entirely. Connection
+  // handling is split in two:
+  //   - Migrate / introspection CLI -> `datasource.url` in prisma.config.ts
+  //   - PrismaClient at runtime      -> the @prisma/adapter-pg driver adapter
+  // See docs/architecture/INTEGRATION-NOTES.md §1.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENUMS — one per state machine. No stringly-typed states anywhere.
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum MemberStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+// ── Mailboxes / deliverability ────────────────────────────────────────────
+
+enum EmailProvider {
+  GMAIL
+  OUTLOOK
+  SMTP
+}
+
+enum EmailAccountStatus {
+  /// OAuth complete, initial backfill still running. Not eligible to send.
+  CONNECTING
+  ACTIVE
+  /// Sending paused by a human. Sync continues.
+  PAUSED
+  /// Refresh token rejected or revoked by the provider. Needs reconnect.
+  DISCONNECTED
+  /// Provider is rate-limiting or rejecting us; automatic cooldown.
+  THROTTLED
+  /// Repeated hard failures. Requires human action before sending resumes.
+  ERROR
+}
+
+enum WarmupStatus {
+  DISABLED
+  RAMPING
+  COMPLETE
+  PAUSED
+}
+
+enum DnsRecordStatus {
+  UNKNOWN
+  PASS
+  WARN
+  FAIL
+  /// The lookup itself failed (NXDOMAIN, timeout). Not the same as FAIL.
+  LOOKUP_ERROR
+}
+
+enum SyncStatus {
+  IDLE
+  BACKFILLING
+  INCREMENTAL
+  /// Gmail returned 404 on the stored historyId — the cursor is too old and a
+  /// bounded re-backfill is required.
+  CURSOR_EXPIRED
+  ERROR
+}
+
+// ── Leads ─────────────────────────────────────────────────────────────────
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  ENGAGED
+  REPLIED
+  UNSUBSCRIBED
+  BOUNCED
+  /// Explicitly excluded from all future campaigns by a human.
+  DISQUALIFIED
+  CUSTOMER
+}
+
+enum VerificationStatus {
+  UNVERIFIED
+  VALID
+  RISKY
+  INVALID
+  UNKNOWN
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  BOOLEAN
+  DATE
+  URL
+  SELECT
+}
+
+// ── Campaigns / sequences ─────────────────────────────────────────────────
+
+enum CampaignStatus {
+  DRAFT
+  /// Human pressed launch; scheduler has not yet materialised the first batch.
+  SCHEDULED
+  ACTIVE
+  PAUSED
+  /// Every enrollment reached a terminal state.
+  COMPLETED
+  ARCHIVED
+}
+
+enum EnrollmentState {
+  /// Enrolled, first step not yet materialised.
+  PENDING
+  ACTIVE
+  /// Waiting out a WAIT step or an out-of-window period.
+  WAITING
+  /// Human or campaign-level pause.
+  PAUSED
+  /// All steps sent, no reply. Terminal.
+  COMPLETED
+  /// Terminal: stopped early. See `stopReason`.
+  STOPPED
+  /// Terminal: a human reply arrived. Sequence halted.
+  REPLIED
+  BOUNCED
+  UNSUBSCRIBED
+  /// Terminal: could not send at all (no mailbox, invalid address, suppressed).
+  FAILED
+}
+
+enum EnrollmentStopReason {
+  HUMAN_REPLY
+  HARD_BOUNCE
+  SOFT_BOUNCE_LIMIT
+  UNSUBSCRIBED
+  SUPPRESSED
+  SPAM_COMPLAINT
+  MANUAL
+  CAMPAIGN_DELETED
+  CONDITION_EXIT
+  LEAD_DISQUALIFIED
+  NO_ELIGIBLE_MAILBOX
+  INVALID_EMAIL
+  DUPLICATE_ENROLLMENT
+}
+
+enum SequenceStepType {
+  EMAIL
+  /// Pure delay. Carries no content.
+  WAIT
+  /// Evaluates a predicate against the enrollment and either continues or exits.
+  CONDITION
+}
+
+enum ConditionKind {
+  HAS_OPENED_ANY
+  HAS_CLICKED_ANY
+  HAS_REPLIED
+  LEAD_FIELD_EQUALS
+  LEAD_HAS_TAG
+  LEAD_IN_LIST
+}
+
+enum ConditionOutcome {
+  /// Predicate false → continue to the next step anyway.
+  CONTINUE
+  /// Predicate false → skip exactly one following step.
+  SKIP_NEXT
+  /// Predicate false → terminate the enrollment (STOPPED / CONDITION_EXIT).
+  STOP
+}
+
+enum ScheduledEmailState {
+  /// Materialised and waiting for its send time. Not yet claimed.
+  SCHEDULED
+  /// Claimed by exactly one worker. Provider call may be in flight.
+  SENDING
+  SENT
+  /// Provider rejected permanently, or retries exhausted. Terminal.
+  FAILED
+  /// Superseded before sending (reply, unsubscribe, pause, campaign edit).
+  CANCELLED
+  /// Provider accepted but the message bounced. Set by reply/bounce processing.
+  BOUNCED
+}
+
+enum ScheduledEmailKind {
+  CAMPAIGN_STEP
+  /// Mailbox-to-mailbox warmup traffic. Never counted in campaign analytics.
+  WARMUP
+  /// One-off manual send from the inbox that still needs queueing and limits.
+  MANUAL
+}
+
+// ── Mail storage ──────────────────────────────────────────────────────────
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum MessageClassification {
+  UNCLASSIFIED
+  HUMAN_REPLY
+  AUTO_REPLY
+  OUT_OF_OFFICE
+  BOUNCE
+  /// Machine-generated but not a bounce or vacation notice (receipts, tickets).
+  AUTOMATED_NOTIFICATION
+  UNSUBSCRIBE_REQUEST
+  SPAM_COMPLAINT
+}
+
+enum BounceType {
+  NONE
+  /// 5.x.x — address does not exist / permanently rejected. Suppress.
+  HARD
+  /// 4.x.x — mailbox full, temporary defer. Retry.
+  SOFT
+  /// Blocked for reputation/policy reasons. Deliverability signal, not a bad address.
+  BLOCKED
+  /// Recognised as a DSN but the status code could not be parsed.
+  UNKNOWN
+}
+
+// ── Events ────────────────────────────────────────────────────────────────
+
+enum EmailEventType {
+  QUEUED
+  SENT
+  /// Only recorded when the provider actually tells us. Gmail API does not, so
+  /// this is mostly unused for GMAIL and MUST NOT be presented as a metric we
+  /// have for every send.
+  DELIVERED
+  BOUNCED
+  OPENED
+  CLICKED
+  REPLIED
+  UNSUBSCRIBED
+  FAILED
+  COMPLAINED
+}
+
+// ── Suppression ───────────────────────────────────────────────────────────
+
+enum SuppressionScope {
+  EMAIL
+  DOMAIN
+}
+
+enum SuppressionReason {
+  UNSUBSCRIBED
+  HARD_BOUNCE
+  SPAM_COMPLAINT
+  MANUAL
+  IMPORTED
+  /// Competitor / partner / existing-customer exclusion list.
+  POLICY
+}
+
+// ── CRM ───────────────────────────────────────────────────────────────────
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum OpportunityStage {
+  NEW
+  QUALIFYING
+  MEETING_BOOKED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum ActivityType {
+  LEAD_CREATED
+  LEAD_IMPORTED
+  LEAD_UPDATED
+  ENROLLED
+  EMAIL_SENT
+  EMAIL_OPENED
+  EMAIL_CLICKED
+  EMAIL_REPLIED
+  EMAIL_BOUNCED
+  UNSUBSCRIBED
+  SEQUENCE_STOPPED
+  NOTE_ADDED
+  TASK_CREATED
+  TASK_COMPLETED
+  OPPORTUNITY_CREATED
+  OPPORTUNITY_STAGE_CHANGED
+  OPPORTUNITY_WON
+  OPPORTUNITY_LOST
+  AI_CLASSIFIED
+  MANUAL_EMAIL_SENT
+}
+
+// ── AI ────────────────────────────────────────────────────────────────────
+
+enum AIAnalysisTarget {
+  EMAIL_MESSAGE
+  EMAIL_THREAD
+  LEAD
+  CAMPAIGN
+  CAMPAIGN_LEAD
+}
+
+enum AIAnalysisKind {
+  REPLY_CLASSIFICATION
+  THREAD_SUMMARY
+  DRAFT_REPLY
+  LEAD_SCORE
+  PERSONALISATION
+  CAMPAIGN_INSIGHT
+}
+
+enum SentimentLabel {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+// ── Queue ─────────────────────────────────────────────────────────────────
+
+enum JobState {
+  /// Eligible for lease once `runAt <= now()`.
+  PENDING
+  /// Leased by a worker. `leaseExpiresAt` bounds the lease.
+  RUNNING
+  /// Failed, will be retried at `runAt`. Distinct from PENDING only for
+  /// observability; the lease query treats both as leasable.
+  RETRYING
+  SUCCEEDED
+  /// Retries exhausted or a permanent error. Terminal, needs a human.
+  DEAD
+  /// Cancelled before running (campaign paused, scheduled email cancelled).
+  CANCELLED
+}
+
+enum JobType {
+  /// Per-campaign tick: materialise due ScheduledEmail rows.
+  SCHEDULER_TICK
+  /// Send exactly one ScheduledEmail.
+  SEND_SCHEDULED_EMAIL
+  /// Incremental Gmail history sync for one mailbox.
+  MAILBOX_SYNC
+  MAILBOX_BACKFILL
+  /// Refresh a provider OAuth access token / re-watch a Gmail mailbox.
+  MAILBOX_RENEW_WATCH
+  /// Process one inbound message: classify, attribute, stop sequences.
+  PROCESS_INBOUND_MESSAGE
+  /// Process one buffered provider webhook payload.
+  PROCESS_WEBHOOK_EVENT
+  AI_CLASSIFY_MESSAGE
+  AI_SUMMARISE_THREAD
+  AI_SCORE_LEAD
+  /// Recompute cached counters for a campaign / step / mailbox from EmailEvent.
+  ROLLUP_ANALYTICS
+  /// DNS lookups for SPF/DKIM/DMARC on one domain.
+  DOMAIN_HEALTH_CHECK
+  /// Warmup traffic generation for one mailbox.
+  WARMUP_TICK
+  /// Streamed CSV import of a lead batch.
+  LEAD_IMPORT_BATCH
+  /// Housekeeping: prune terminal jobs, expire invites, sweep orphaned AI rows.
+  MAINTENANCE
+}
+
+enum WebhookState {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  /// Payload could not be attributed to a mailbox we own. Kept for forensics.
+  UNMATCHED
+  FAILED
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IDENTITY — global by design. A User is a person, not a tenant resource.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A human login identity. Global, NOT workspace-scoped: one person may belong
+/// to several workspaces with one password and one session.
+model User {
+  id String @id @default(cuid())
+
+  /// Stored lowercased and trimmed at the service boundary. Globally unique —
+  /// this is one of only two legitimate global uniques in the schema (the other
+  /// is Workspace.slug), because it is the login handle, not tenant data.
+  email String @unique
+
+  /// argon2id hash from `Bun.password.hash`. Nullable so an invited user row can
+  /// exist before the invite is accepted and a password is chosen.
+  passwordHash String?
+
+  name      String?
+  avatarUrl String?
+
+  emailVerifiedAt DateTime? @db.Timestamptz(6)
+  /// Null until the first successful login.
+  lastLoginAt     DateTime? @db.Timestamptz(6)
+  /// Reset to 0 on success. Drives login throttling alongside the rate limiter.
+  failedLoginCount Int      @default(0)
+  /// Set when failedLoginCount crosses the threshold; cleared on unlock.
+  lockedUntil     DateTime? @db.Timestamptz(6)
+
+  /// IANA zone, e.g. "Europe/Berlin". Used to render timestamps, never to store.
+  timezone String @default("UTC")
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+  /// Soft delete. A hard delete would orphan authorship on audit logs, notes and
+  /// activities, which we must retain.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  sessions          Session[]
+  memberships       WorkspaceMember[]
+  invitesSent       WorkspaceInvite[]      @relation("InviteInviter")
+  passwordResets    PasswordResetToken[]
+  auditLogs         AuditLog[]
+  connectedAccounts EmailAccount[]         @relation("EmailAccountConnectedBy")
+  assignedLeads     Lead[]                 @relation("LeadOwner")
+  createdCampaigns  Campaign[]             @relation("CampaignCreatedBy")
+  notes             Note[]
+  tasksAssigned     Task[]                 @relation("TaskAssignee")
+  tasksCreated      Task[]                 @relation("TaskCreatedBy")
+  opportunities     Opportunity[]          @relation("OpportunityOwner")
+  activities        Activity[]             @relation("ActivityActor")
+  leadImports       LeadImport[]
+
+  @@index([deletedAt])
+}
+
+/// Server-side session. Only the SHA-256 hash of the opaque token is stored, so
+/// a database leak cannot be replayed as a live session.
+model Session {
+  id String @id @default(cuid())
+
+  /// SHA-256 (hex) of the 256-bit random cookie value. Unique globally: the
+  /// token space is the identity space, there is no tenant dimension.
+  tokenHash String @unique
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Workspace the session is currently "in". Nullable for a user with no
+  /// membership yet (just registered, not yet in a workspace).
+  activeWorkspaceId String?
+  activeWorkspace   Workspace? @relation(fields: [activeWorkspaceId], references: [id], onDelete: SetNull)
+
+  /// Sliding expiry, extended on use.
+  expiresAt DateTime @db.Timestamptz(6)
+  /// Hard ceiling. Never extended — forces re-authentication eventually.
+  absoluteExpiresAt DateTime @db.Timestamptz(6)
+  /// Set on explicit logout or admin revocation. Checked before expiresAt so a
+  /// revoked-but-unexpired session is dead immediately.
+  revokedAt DateTime? @db.Timestamptz(6)
+
+  ipAddress String?
+  userAgent String?
+
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  lastActiveAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@index([activeWorkspaceId])
+}
+
+/// Single-use password reset token. Hash-at-rest, same reasoning as Session.
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @db.Timestamptz(6)
+  usedAt    DateTime? @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENANCY ROOT
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The tenant. Every tenant-owned row hangs off this, directly or transitively.
+model Workspace {
+  id String @id @default(cuid())
+
+  name String
+  /// URL-safe handle. Globally unique because it appears in URLs — the second
+  /// and last legitimate global unique.
+  slug String @unique
+
+  /// Default IANA timezone for new campaigns and mailboxes in this workspace.
+  timezone String @default("UTC")
+
+  /// Workspace-wide ceiling applied on top of per-mailbox caps. Null = no
+  /// workspace ceiling, only per-mailbox limits apply.
+  dailySendLimit Int?
+
+  /// When true, every outbound campaign email gets a tracking pixel unless the
+  /// campaign overrides it. Tracking is opt-out per campaign.
+  trackOpensDefault  Boolean @default(true)
+  trackClicksDefault Boolean @default(true)
+
+  /// Appended to every campaign email body. Required for CAN-SPAM/GDPR posture.
+  unsubscribeFooterHtml String?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+  /// Soft delete: a hard workspace delete would cascade across every table.
+  /// Deletion is a two-phase operation — mark, then a MAINTENANCE job purges.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  members         WorkspaceMember[]
+  invites         WorkspaceInvite[]
+  sessions        Session[]
+  auditLogs       AuditLog[]
+  emailAccounts   EmailAccount[]
+  domains         Domain[]
+  leads           Lead[]
+  leadLists       LeadList[]
+  leadTags        LeadTag[]
+  customFields    CustomFieldDefinition[]
+  leadImports     LeadImport[]
+  campaigns       Campaign[]
+  sequences       Sequence[]
+  sequenceSteps   SequenceStep[]
+  stepVariants    SequenceStepVariant[]
+  campaignLeads   CampaignLead[]
+  scheduledEmails ScheduledEmail[]
+  threads         EmailThread[]
+  messages        EmailMessage[]
+  events          EmailEvent[]
+  suppressions    Suppression[]
+  tasks           Task[]
+  notes           Note[]
+  opportunities   Opportunity[]
+  activities      Activity[]
+  experiments     Experiment[]
+  aiAnalyses      AIAnalysis[]
+  syncStates      SyncState[]
+  webhookEvents   WebhookEvent[]
+  jobs            Job[]
+  warmupPools     WarmupPool[]
+  warmupMembers   WarmupPoolMember[]
+  leadListMemberships LeadListMembership[]
+  leadTagLinks        LeadTagLink[]
+  campaignMailboxes   CampaignMailbox[]
+  campaignListSources CampaignLeadListSource[]
+  experimentArms      ExperimentArm[]
+  trackingLinks   TrackingLink[]
+  dailySendStats  MailboxDailyStat[]
+
+  @@index([deletedAt])
+}
+
+/// Membership is the join between a global User and a Workspace, and the carrier
+/// of the role. Authorization reads this, never a column on User.
+model WorkspaceMember {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role   Role         @default(MEMBER)
+  status MemberStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// One membership per user per workspace.
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@index([workspaceId, role])
+}
+
+/// A pending invitation. The token is hashed; the email is stored so the accept
+/// flow can bind to the right identity even if the user registers separately.
+model WorkspaceInvite {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  email String
+  role  Role   @default(MEMBER)
+
+  tokenHash String @unique
+
+  invitedById String?
+  invitedBy   User?   @relation("InviteInviter", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  status     InviteStatus @default(PENDING)
+  expiresAt  DateTime     @db.Timestamptz(6)
+  acceptedAt DateTime?    @db.Timestamptz(6)
+  revokedAt  DateTime?    @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// At most one live invite per email per workspace. Enforced fully by a
+  /// PARTIAL unique index in migration SQL (`WHERE status = 'PENDING'`), which
+  /// Prisma cannot express; this composite index backs the lookup.
+  @@index([workspaceId, email])
+  @@index([status, expiresAt])
+}
+
+/// Append-only security/compliance log. UPDATE and DELETE are revoked at the
+/// database level (see migration SQL) so application bugs cannot rewrite it.
+model AuditLog {
+  id BigInt @id @default(autoincrement())
+
+  /// Nullable: some auditable events (failed login for an unknown email) happen
+  /// before any workspace is known. This is a deliberate, documented exception
+  /// to the non-null-workspaceId rule.
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  /// Nullable: the actor may be the system (worker, scheduler) or unknown.
+  actorUserId String?
+  actorUser   User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  /// Stable dotted verb, e.g. "mailbox.connected", "campaign.launched",
+  /// "member.role_changed", "leads.bulk_deleted". Not an enum: the vocabulary
+  /// grows every phase and a migration per new event is friction with no payoff.
+  action String
+
+  /// Model name of the affected row, e.g. "EmailAccount".
+  targetType String?
+  targetId   String?
+
+  /// Redacted, structured detail. NEVER secrets, tokens, or email bodies.
+  metadata Json?
+
+  ipAddress String?
+  userAgent String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([actorUserId, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAILBOXES & DELIVERABILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A connected sending/receiving mailbox. This is the unit of rate limiting, of
+/// OAuth credentials, and of inbox sync. It is a workspace resource, distinct
+/// from the User identity that connected it.
+model EmailAccount {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  provider EmailProvider
+
+  /// The mailbox address, lowercased. Workspace-scoped unique: two workspaces may
+  /// legitimately connect the same shared mailbox.
+  email String
+
+  /// Display name used in the From header. Falls back to the workspace default.
+  fromName String?
+
+  /// Reply-To override. Rarely used; set it and Gmail threading still works
+  /// because we match on Message-ID, not on the reply address.
+  replyToEmail String?
+
+  /// The provider's own account identifier (Gmail: the `emailAddress` from
+  /// users.getProfile; Outlook: the object id). Used to attribute inbound
+  /// webhooks that carry no workspace context.
+  providerAccountId String?
+
+  // ── Credentials at rest. AES-256-GCM, never returned to a client. ──
+  /// Base64 of iv || ciphertext || authTag. Null for SMTP-only accounts.
+  encryptedRefreshToken String?
+  /// Short-lived; cached to avoid a refresh round trip on every send.
+  encryptedAccessToken  String?
+  accessTokenExpiresAt  DateTime? @db.Timestamptz(6)
+  /// Key version so ENCRYPTION_KEY can rotate without a big-bang re-encrypt.
+  encryptionKeyVersion  Int       @default(1)
+  /// Space-separated granted scopes. Compared against required scopes so we can
+  /// tell "needs reconsent" apart from "revoked".
+  grantedScopes         String?
+
+  // ── SMTP / IMAP (Phase 11). Encrypted the same way. ──
+  smtpHost              String?
+  smtpPort              Int?
+  smtpUsername          String?
+  encryptedSmtpPassword String?
+  imapHost              String?
+  imapPort              Int?
+
+  status         EmailAccountStatus @default(CONNECTING)
+  /// Human-readable last failure. Never contains a token.
+  statusMessage  String?
+  /// Set when THROTTLED. The scheduler will not select this mailbox before it.
+  throttledUntil DateTime?          @db.Timestamptz(6)
+
+  // ── Sending limits. Enforced per mailbox, in `timezone`. ──
+  /// Hard daily ceiling for campaign sends. Gmail's own cap is ~500/day for
+  /// consumer and 2000/day for Workspace; deliverability advice is far lower, so
+  /// the default is intentionally conservative.
+  dailySendLimit Int @default(50)
+  /// Minimum gap between two sends from this mailbox. Prevents burst patterns
+  /// that look automated.
+  minSecondsBetweenSends Int @default(90)
+  /// Jitter added on top of the minimum, uniformly at random in [0, this].
+  sendJitterSeconds      Int @default(120)
+
+  /// IANA zone that defines "today" for the daily cap and the sending window.
+  timezone String @default("UTC")
+  /// Minutes from local midnight. 480 = 08:00. Window is [start, end).
+  sendWindowStartMinute Int   @default(480)
+  sendWindowEndMinute   Int   @default(1020)
+  /// ISO-8601 weekdays permitted for sending: 1 = Monday … 7 = Sunday.
+  sendWindowDays        Int[] @default([1, 2, 3, 4, 5])
+
+  // ── Warmup ──
+  warmupStatus       WarmupStatus @default(DISABLED)
+  warmupDailyTarget  Int          @default(0)
+  warmupStartedAt    DateTime?    @db.Timestamptz(6)
+
+  // ── Health cache. Truth is EmailEvent; these make the list page cheap. ──
+  /// Rolling 0-100 score computed by the deliverability rollup.
+  healthScore     Int      @default(100)
+  sentCount       Int      @default(0)
+  bouncedCount    Int      @default(0)
+  repliedCount    Int      @default(0)
+  complainedCount Int      @default(0)
+  lastSentAt      DateTime? @db.Timestamptz(6)
+  lastSyncedAt    DateTime? @db.Timestamptz(6)
+  lastErrorAt     DateTime? @db.Timestamptz(6)
+  consecutiveFailures Int   @default(0)
+
+  domainId String?
+  domain   Domain? @relation(fields: [domainId], references: [id], onDelete: SetNull)
+
+  connectedByUserId String?
+  connectedBy       User?   @relation("EmailAccountConnectedBy", fields: [connectedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+  /// Soft delete. Hard-deleting a mailbox would cascade away its threads and the
+  /// EmailEvent history that analytics depends on.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  syncState        SyncState?
+  threads          EmailThread[]
+  messages         EmailMessage[]
+  scheduledEmails  ScheduledEmail[]
+  events           EmailEvent[]
+  campaignMailboxes CampaignMailbox[]
+  dailyStats       MailboxDailyStat[]
+  warmupMemberships WarmupPoolMember[]
+  webhookEvents    WebhookEvent[]
+
+  @@unique([workspaceId, email])
+  @@index([workspaceId, status])
+  @@index([workspaceId, deletedAt])
+  @@index([domainId])
+  /// Serves the scheduler's mailbox-selection scan.
+  @@index([status, throttledUntil])
+  @@index([providerAccountId])
+}
+
+/// A sending domain with cached DNS auth health. One row per apex/sending domain,
+/// derived from the mailbox addresses in the workspace.
+model Domain {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  /// Lowercased hostname, e.g. "outbound.acme.com".
+  name String
+
+  spfStatus   DnsRecordStatus @default(UNKNOWN)
+  dkimStatus  DnsRecordStatus @default(UNKNOWN)
+  dmarcStatus DnsRecordStatus @default(UNKNOWN)
+  /// MX presence — a sending domain with no MX cannot receive bounces or replies.
+  mxStatus    DnsRecordStatus @default(UNKNOWN)
+
+  /// The raw records we resolved, verbatim, so the UI can show what we saw
+  /// rather than only our verdict.
+  spfRecord   String?
+  dkimRecord  String?
+  dmarcRecord String?
+  /// DKIM selector we checked, e.g. "google". Needed to reproduce the lookup.
+  dkimSelector String?
+
+  /// Parsed DMARC policy: "none" | "quarantine" | "reject". Text, not an enum:
+  /// it mirrors whatever the record literally says.
+  dmarcPolicy String?
+
+  /// Explanations keyed by check, e.g. { "spf": "more than 10 DNS lookups" }.
+  issues Json?
+
+  /// 0-100 cache of the four checks plus mailbox reputation.
+  healthScore Int @default(0)
+
+  lastCheckedAt DateTime? @db.Timestamptz(6)
+  /// Set when the lookup itself failed, so we can distinguish "bad config" from
+  /// "we could not tell".
+  lastCheckError String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  emailAccounts EmailAccount[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId])
+  @@index([lastCheckedAt])
+}
+
+/// Per-mailbox provider sync cursor. Split from EmailAccount because it is
+/// written on every sync tick and we do not want that write contending with
+/// mailbox configuration reads, nor bloating the EmailAccount row's HOT chain.
+model SyncState {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  emailAccountId String       @unique
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  status SyncStatus @default(IDLE)
+
+  /// Gmail `historyId`. Opaque, monotonic per mailbox, and Gmail expires it
+  /// after roughly a week of inactivity — hence CURSOR_EXPIRED handling.
+  historyId String?
+  /// Outlook / IMAP equivalent (deltaLink or UIDVALIDITY:UIDNEXT).
+  deltaToken String?
+  /// Gmail `users.watch` expiry. Watches last 7 days max and MUST be renewed.
+  watchExpiresAt DateTime? @db.Timestamptz(6)
+
+  /// Backfill progress. `historyId` is only trustworthy once backfill completed.
+  backfillPageToken   String?
+  backfillCompletedAt DateTime? @db.Timestamptz(6)
+  /// We do not import the entire mailbox history — only from this point.
+  backfillAfter       DateTime? @db.Timestamptz(6)
+
+  lastSyncStartedAt   DateTime? @db.Timestamptz(6)
+  lastSyncCompletedAt DateTime? @db.Timestamptz(6)
+  messagesSynced      Int       @default(0)
+  consecutiveFailures Int       @default(0)
+  lastError           String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([workspaceId])
+  @@index([status, watchExpiresAt])
+}
+
+/// Per-mailbox per-local-day send counter. This exists so the daily cap check is
+/// a single indexed read instead of a COUNT over ScheduledEmail, and so the cap
+/// can be enforced inside the same transaction that claims a send.
+model MailboxDailyStat {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// The mailbox's LOCAL calendar day, stored as a date with no time component.
+  /// Computed from the mailbox timezone at claim time. A DST shift changes the
+  /// wall-clock length of the day but not which date a send counts against,
+  /// which is the behaviour operators expect.
+  localDate DateTime @db.Date
+
+  sentCount    Int @default(0)
+  warmupCount  Int @default(0)
+  failedCount  Int @default(0)
+  bouncedCount Int @default(0)
+  repliedCount Int @default(0)
+  openedCount  Int @default(0)
+  clickedCount Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([emailAccountId, localDate])
+  @@index([workspaceId, localDate])
+}
+
+/// A pool of our own mailboxes that email each other to build sending
+/// reputation. Deliberately minimal: no third-party warmup network.
+model WarmupPool {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name    String
+  enabled Boolean @default(false)
+
+  /// Sends per mailbox per day on day 1 of the ramp.
+  startDailyVolume Int @default(2)
+  /// Ceiling the ramp climbs to.
+  maxDailyVolume   Int @default(20)
+  /// Additional sends permitted each day of the ramp.
+  rampIncrement    Int @default(2)
+  /// Fraction of received warmup mail that the recipient replies to, 0-1.
+  replyRate        Decimal @default(0.300) @db.Decimal(4, 3)
+  /// Fraction moved out of spam if found there, 0-1.
+  spamRescueRate   Decimal @default(1.000) @db.Decimal(4, 3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  members WarmupPoolMember[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, enabled])
+}
+
+model WarmupPoolMember {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  warmupPoolId String
+  warmupPool   WarmupPool @relation(fields: [warmupPoolId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// Day index within the ramp; drives today's target volume.
+  rampDay Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// A mailbox belongs to at most one pool. Enforced by a plain unique index on
+  /// ("emailAccountId") in migration SQL rather than `@@unique` here, so Prisma
+  /// keeps this relation one-to-many and does not collapse
+  /// EmailAccount.warmupMemberships into a single optional row.
+  @@unique([warmupPoolId, emailAccountId])
+  @@index([workspaceId])
+  @@index([warmupPoolId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEADS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A person we may contact. Deduplicated by email within the workspace.
+model Lead {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  /// Lowercased, trimmed. Workspace-scoped unique — this is THE lead dedup key
+  /// and the reason a CSV re-import cannot create duplicates.
+  email String
+
+  /// The address exactly as supplied (casing, plus-address, display name
+  /// stripped). Kept for support questions about what the customer uploaded.
+  emailRaw String?
+
+  firstName String?
+  lastName  String?
+  /// Denormalised for sorting and for `{{fullName}}` substitution without a
+  /// runtime concat that produces " " for empty names.
+  fullName  String?
+
+  companyName String?
+  jobTitle    String?
+  phone       String?
+  linkedinUrl String?
+  websiteUrl  String?
+
+  /// Lowercased email domain, extracted on write. Powers domain-level
+  /// suppression checks and "one lead per company" reporting without a LIKE scan.
+  emailDomain String?
+
+  city    String?
+  state   String?
+  country String?
+  /// IANA zone if we could infer one. Nullable and often null — we do not guess
+  /// aggressively, and the campaign timezone is the fallback.
+  timezone String?
+
+  status             LeadStatus         @default(NEW)
+  verificationStatus VerificationStatus @default(UNVERIFIED)
+  verifiedAt         DateTime?          @db.Timestamptz(6)
+
+  /// AI lead score, 0-100. Null when never scored. Integer, not float: a decimal
+  /// point of precision here is false confidence.
+  score Int?
+
+  /// Workspace-defined custom fields, validated against CustomFieldDefinition at
+  /// the service boundary. JSONB, not a tall EAV table: values are read as a
+  /// whole record for personalisation and never aggregated across leads.
+  customFields Json @default("{}")
+
+  /// Free-form provenance, e.g. "csv:2026-08-14", "manual", "api".
+  source String?
+
+  ownerUserId String?
+  owner       User?   @relation("LeadOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+
+  leadImportId String?
+  leadImport   LeadImport? @relation(fields: [leadImportId], references: [id], onDelete: SetNull)
+
+  // ── Engagement caches. Truth is EmailEvent. ──
+  lastContactedAt DateTime? @db.Timestamptz(6)
+  lastRepliedAt   DateTime? @db.Timestamptz(6)
+  lastOpenedAt    DateTime? @db.Timestamptz(6)
+  sentCount       Int       @default(0)
+  openCount       Int       @default(0)
+  clickCount      Int       @default(0)
+  replyCount      Int       @default(0)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+  /// Soft delete. Leads are referenced by threads, events, opportunities and
+  /// audit history; hard deletion is a MAINTENANCE operation with explicit
+  /// confirmation (GDPR erasure), not a click in a table.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  listMemberships LeadListMembership[]
+  tagLinks        LeadTagLink[]
+  campaignLeads   CampaignLead[]
+  scheduledEmails ScheduledEmail[]
+  threads         EmailThread[]
+  events          EmailEvent[]
+  tasks           Task[]
+  notes           Note[]
+  opportunities   Opportunity[]
+  activities      Activity[]
+  aiAnalyses      AIAnalysis[]
+
+  @@unique([workspaceId, email])
+  /// Serves the default leads list: workspace + not deleted, newest first.
+  @@index([workspaceId, deletedAt, createdAt(sort: Desc)])
+  @@index([workspaceId, status])
+  @@index([workspaceId, ownerUserId])
+  @@index([workspaceId, emailDomain])
+  @@index([workspaceId, score(sort: Desc)])
+  @@index([leadImportId])
+}
+
+/// A named, static collection of leads. Static by design: dynamic segments are
+/// saved filters (see the "not modelled yet" section of the database doc), and
+/// mixing the two in one table produced two mutually incompatible semantics.
+model LeadList {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  /// Cache of membership count. Recomputed on bulk operations.
+  leadCount Int @default(0)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  memberships LeadListMembership[]
+  campaigns   CampaignLeadListSource[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, deletedAt])
+}
+
+model LeadListMembership {
+  id String @id @default(cuid())
+
+  /// Denormalised from both parents so every membership query is workspace-safe
+  /// without a join. The FK is real, not just a column: a mismatched value must be
+  /// impossible, not merely discouraged.
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  leadListId String
+  leadList   LeadList @relation(fields: [leadListId], references: [id], onDelete: Cascade)
+
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([leadListId, leadId])
+  @@index([leadId])
+  @@index([workspaceId])
+}
+
+model LeadTag {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name String
+  /// Semantic token name from the design system, e.g. "info" | "success". Not a
+  /// hex value — components consume semantic variables only.
+  colorToken String @default("info")
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  leadLinks LeadTagLink[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId])
+}
+
+model LeadTagLink {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  leadTagId String
+  leadTag   LeadTag @relation(fields: [leadTagId], references: [id], onDelete: Cascade)
+
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([leadTagId, leadId])
+  @@index([leadId])
+  @@index([workspaceId])
+}
+
+/// Declares a workspace's custom lead field: its key, type, and validation. The
+/// VALUES live in `Lead.customFields` (JSONB); this table is the schema for them.
+model CustomFieldDefinition {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  /// The JSONB key and the personalisation token name, e.g. "industry" →
+  /// `{{industry}}`. Immutable after creation: renaming it would silently break
+  /// every sequence body referencing it.
+  key   String
+  label String
+  type  CustomFieldType @default(TEXT)
+
+  /// Allowed values when type = SELECT.
+  options String[] @default([])
+
+  required     Boolean @default(false)
+  defaultValue String?
+
+  /// Display order in the lead detail panel.
+  position Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([workspaceId, key])
+  @@index([workspaceId, position])
+}
+
+/// One CSV import run. Exists so a bad import is auditable and undoable: every
+/// Lead created carries `leadImportId`.
+model LeadImport {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  uploadedByUserId String?
+  uploadedBy       User?   @relation(fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  fileName  String
+  fileSize  Int
+  /// Column header → lead field or custom field key, as chosen in the mapping UI.
+  columnMap Json
+
+  totalRows     Int @default(0)
+  processedRows Int @default(0)
+  createdCount  Int @default(0)
+  updatedCount  Int @default(0)
+  skippedCount  Int @default(0)
+  errorCount    Int @default(0)
+
+  /// Bounded sample of row errors: `[{ row, column, message }]`. Capped at 100
+  /// entries so a 50k-row disaster does not create a 50k-element JSON blob.
+  errorSample Json?
+
+  /// Reuses JobState so the import surface has the same five UI states as the
+  /// queue and needs no second vocabulary.
+  state       JobState  @default(PENDING)
+  startedAt   DateTime? @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  leads Lead[]
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([uploadedByUserId])
+}
+
+/// Suppression / do-not-contact list. Checked before every enrollment AND again
+/// immediately before every send, because a lead can unsubscribe after a
+/// ScheduledEmail row already exists.
+model Suppression {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  scope SuppressionScope @default(EMAIL)
+
+  /// For scope=EMAIL: the lowercased address, with plus-addressing stripped so
+  /// `a+news@x.com` unsubscribing also suppresses `a@x.com`. For scope=DOMAIN:
+  /// the bare hostname. One column, not two nullable ones — the pre-send check
+  /// is then two exact lookups, never a LIKE.
+  value String
+
+  reason SuppressionReason @default(UNSUBSCRIBED)
+  /// Free text or provider DSN excerpt explaining the entry.
+  note   String?
+
+  /// Provenance, all nullable: an imported suppression has none of them.
+  sourceCampaignId String?
+  sourceLeadId     String?
+  sourceMessageId  String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([workspaceId, scope, value])
+  @@index([workspaceId, value])
+  @@index([workspaceId, reason])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAMPAIGNS & SEQUENCES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A campaign is the run unit: one sequence, a set of enrolled leads, a set of
+/// sending mailboxes, and a schedule.
+model Campaign {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name String
+
+  status CampaignStatus @default(DRAFT)
+
+  createdByUserId String?
+  createdBy       User?   @relation("CampaignCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  // ── Schedule. The campaign window INTERSECTS each mailbox's window; the
+  // narrower of the two wins, so a mailbox can never be pushed outside its own
+  // limits by a campaign setting. ──
+  /// IANA zone the window is interpreted in.
+  timezone              String @default("UTC")
+  sendWindowStartMinute Int    @default(480)
+  sendWindowEndMinute   Int    @default(1020)
+  sendWindowDays        Int[]  @default([1, 2, 3, 4, 5])
+
+  /// Optional campaign-level throttle, on top of per-mailbox daily limits.
+  dailySendLimit Int?
+
+  /// Do not materialise sends before this instant (scheduled launch).
+  startAt DateTime? @db.Timestamptz(6)
+  /// Hard stop: no send is materialised at or after this instant.
+  endAt   DateTime? @db.Timestamptz(6)
+
+  /// When true, an inbound HUMAN_REPLY on any thread of the enrollment stops the
+  /// sequence. Effectively always true; exposed because a pure notification
+  /// campaign occasionally wants it off.
+  stopOnReply Boolean @default(true)
+  /// Stop the sequence when the lead replies to ANY campaign in the workspace,
+  /// not just this one. Off by default — surprising if silently on.
+  stopOnReplyAnyCampaign Boolean @default(false)
+  stopOnClick   Boolean @default(false)
+  stopOnOpen    Boolean @default(false)
+
+  trackOpens  Boolean @default(true)
+  trackClicks Boolean @default(true)
+
+  /// Skip a lead already enrolled in another ACTIVE campaign. Prevents the same
+  /// person receiving two unrelated sequences in the same week.
+  skipIfInOtherCampaign Boolean @default(true)
+
+  /// Send follow-ups in the same Gmail thread as step 1 (References/In-Reply-To
+  /// set). Improves reply rate; also means one bad thread taints the follow-ups.
+  threadFollowUps Boolean @default(true)
+
+  launchedAt  DateTime? @db.Timestamptz(6)
+  pausedAt    DateTime? @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+
+  // ── Analytics caches. Truth is EmailEvent. ──
+  leadCount        Int @default(0)
+  sentCount        Int @default(0)
+  deliveredCount   Int @default(0)
+  openedCount      Int @default(0)
+  clickedCount     Int @default(0)
+  repliedCount     Int @default(0)
+  bouncedCount     Int @default(0)
+  unsubscribedCount Int @default(0)
+  /// Distinct leads with >=1 OPENED. Not the same as openedCount, which counts
+  /// events. Both are needed: one is a rate denominator, one is volume.
+  uniqueOpenedCount  Int @default(0)
+  uniqueClickedCount Int @default(0)
+  statsUpdatedAt   DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  sequence        Sequence?
+  mailboxes       CampaignMailbox[]
+  listSources     CampaignLeadListSource[]
+  campaignLeads   CampaignLead[]
+  scheduledEmails ScheduledEmail[]
+  threads         EmailThread[]
+  events          EmailEvent[]
+  experiments     Experiment[]
+  opportunities   Opportunity[]
+  aiAnalyses      AIAnalysis[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, status, updatedAt(sort: Desc)])
+  @@index([workspaceId, deletedAt])
+  /// Serves the scheduler's "which campaigns need a tick" scan.
+  @@index([status, startAt])
+}
+
+/// Join: which mailboxes a campaign rotates through. Rotation spreads volume and
+/// stops one mailbox absorbing an entire campaign's reputation risk.
+model CampaignMailbox {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// Relative rotation weight. Higher = selected more often.
+  weight Int @default(1)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([campaignId, emailAccountId])
+  @@index([emailAccountId])
+  @@index([workspaceId])
+}
+
+/// Records that a campaign drew leads from a list. Audit/provenance only —
+/// enrollment itself is materialised into CampaignLead rows, so later edits to
+/// the list do not silently mutate a running campaign.
+model CampaignLeadListSource {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  leadListId String
+  leadList   LeadList @relation(fields: [leadListId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([campaignId, leadListId])
+  @@index([leadListId])
+  @@index([workspaceId])
+}
+
+/// The ordered step container for one campaign. 1:1 with Campaign — modelled
+/// separately because a step list has its own version identity and because
+/// reusable sequence templates are a plausible near-term extension.
+model Sequence {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  campaignId String   @unique
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  name String @default("Sequence")
+
+  /// Bumped on every structural edit. ScheduledEmail records the version it was
+  /// materialised from, so an edit mid-flight is detectable rather than silently
+  /// producing a sequence nobody designed.
+  version Int @default(1)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  steps SequenceStep[]
+
+  @@index([workspaceId])
+}
+
+/// One node in the sequence. EMAIL steps carry content via variants; WAIT steps
+/// carry only a delay; CONDITION steps carry a predicate.
+model SequenceStep {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  sequenceId String
+  sequence   Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  type SequenceStepType @default(EMAIL)
+
+  /// 1-based position. Gaps are permitted between edits; ordering is by this
+  /// column, not by array index.
+  position Int
+
+  /// Delay BEFORE this step executes, measured from the previous step's send (or
+  /// from enrollment for position 1). Minutes, not days: a "3 day" follow-up is
+  /// 4320, and minutes let us express "wait 4 hours" without a second unit
+  /// column. Zero for step 1.
+  delayMinutes Int @default(0)
+
+  // ── CONDITION fields. All null unless type = CONDITION. ──
+  conditionKind    ConditionKind?
+  /// Operand for LEAD_FIELD_EQUALS / LEAD_HAS_TAG / LEAD_IN_LIST.
+  conditionField   String?
+  conditionValue   String?
+  /// What to do when the predicate is FALSE.
+  conditionOutcome ConditionOutcome?
+
+  /// Set false to skip a step without deleting it and losing its history.
+  enabled Boolean @default(true)
+
+  // ── Caches. Truth is EmailEvent filtered by sequenceStepId. ──
+  sentCount    Int @default(0)
+  openedCount  Int @default(0)
+  clickedCount Int @default(0)
+  repliedCount Int @default(0)
+  bouncedCount Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  variants        SequenceStepVariant[]
+  scheduledEmails ScheduledEmail[]
+  events          EmailEvent[]
+  experiments     Experiment[]
+  campaignLeads   CampaignLead[]        @relation("CampaignLeadCurrentStep")
+
+  /// Position is unique within a sequence. Reordering swaps positions inside one
+  /// transaction (via a temporary negative position) to respect this.
+  @@unique([sequenceId, position])
+  @@index([workspaceId])
+  @@index([sequenceId, position])
+}
+
+/// The content of an EMAIL step. Every EMAIL step has at least one variant; a
+/// second variant makes it an A/B test. Content lives here and never on the step,
+/// so "add a B variant" is an insert rather than a schema-shaped special case.
+model SequenceStepVariant {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  sequenceStepId String
+  sequenceStep   SequenceStep @relation(fields: [sequenceStepId], references: [id], onDelete: Cascade)
+
+  /// "A", "B", "C" … Display label and the stable key for experiment reporting.
+  label String @default("A")
+
+  /// Handlebars-ish tokens: `{{firstName}}`, `{{companyName}}`, custom field keys.
+  /// Empty subject means "reply in thread with no new subject" for follow-ups.
+  subject  String
+  bodyHtml String
+  /// Plain-text alternative. Required: an HTML-only cold email is a spam signal.
+  bodyText String
+
+  /// Rotation weight within the step, 0-100. Weights across enabled variants are
+  /// normalised at assignment time; they need not sum to 100.
+  weight Int @default(100)
+
+  enabled Boolean @default(true)
+
+  // ── Caches. Truth is EmailEvent filtered by variantId. ──
+  sentCount    Int @default(0)
+  openedCount  Int @default(0)
+  clickedCount Int @default(0)
+  repliedCount Int @default(0)
+  bouncedCount Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  scheduledEmails ScheduledEmail[]
+  events          EmailEvent[]
+  experimentArms  ExperimentArm[]
+
+  @@unique([sequenceStepId, label])
+  @@index([workspaceId])
+  @@index([sequenceStepId, enabled])
+}
+
+/// Per-lead enrollment state in one campaign. This row is the sequence's program
+/// counter for that lead and the anchor a reply is attributed to.
+model CampaignLead {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  state EnrollmentState @default(PENDING)
+
+  /// The step to execute next. Null when the enrollment is terminal.
+  currentStepId String?
+  currentStep   SequenceStep? @relation("CampaignLeadCurrentStep", fields: [currentStepId], references: [id], onDelete: SetNull)
+
+  /// Highest step position already sent. Cheap ordering key for reports and the
+  /// value the scheduler advances; survives step deletion, unlike currentStepId.
+  lastCompletedPosition Int @default(0)
+
+  /// When the next step becomes eligible. The scheduler's primary predicate.
+  /// Null for terminal or paused enrollments.
+  nextStepAt DateTime? @db.Timestamptz(6)
+
+  /// Mailbox chosen at enrollment and then kept for the whole sequence. Rotating
+  /// mid-sequence would send follow-ups from a different address in the same
+  /// thread, which looks broken to the recipient.
+  assignedEmailAccountId String?
+
+  /// The thread step 1 opened. Follow-ups reply into it when
+  /// `campaign.threadFollowUps` is true, and inbound replies here attribute to
+  /// this enrollment directly.
+  primaryThreadId String?
+  primaryThread   EmailThread? @relation("CampaignLeadPrimaryThread", fields: [primaryThreadId], references: [id], onDelete: SetNull)
+
+  stopReason EnrollmentStopReason?
+  stoppedAt  DateTime?             @db.Timestamptz(6)
+
+  enrolledAt  DateTime  @default(now()) @db.Timestamptz(6)
+  startedAt   DateTime? @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+
+  // ── Caches. ──
+  sentCount     Int       @default(0)
+  openCount     Int       @default(0)
+  clickCount    Int       @default(0)
+  replyCount    Int       @default(0)
+  lastSentAt    DateTime? @db.Timestamptz(6)
+  lastRepliedAt DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  scheduledEmails ScheduledEmail[]
+  threads         EmailThread[]    @relation("EmailThreadCampaignLead")
+  events          EmailEvent[]
+  activities      Activity[]
+  opportunities   Opportunity[]
+  aiAnalyses      AIAnalysis[]
+  messages        EmailMessage[]
+
+  /// A lead is enrolled in a campaign AT MOST ONCE. This is the first line of
+  /// defence against duplicate sends, upstream of the ScheduledEmail constraint.
+  @@unique([campaignId, leadId])
+  /// THE scheduler query: due enrollments for active campaigns.
+  @@index([state, nextStepAt])
+  @@index([campaignId, state])
+  @@index([workspaceId, state])
+  @@index([leadId, state])
+  @@index([currentStepId])
+  @@index([primaryThreadId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SENDING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The materialised intent to send exactly one email. This table is where
+/// "we never send the same email twice" is enforced BY THE DATABASE, via
+/// `@@unique([campaignLeadId, sequenceStepId])` plus `@@unique([dedupeKey])`.
+///
+/// Lifecycle: SCHEDULED → SENDING → SENT | FAILED, or → CANCELLED before claim.
+/// The SCHEDULED→SENDING transition is a conditional UPDATE guarded by
+/// `state = 'SCHEDULED'`; exactly one worker wins, so a provider call can happen
+/// at most once per row even with N workers and at-least-once job delivery.
+model ScheduledEmail {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  kind ScheduledEmailKind @default(CAMPAIGN_STEP)
+
+  /// Null for WARMUP and MANUAL sends.
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: Cascade)
+
+  sequenceStepId String?
+  sequenceStep   SequenceStep? @relation(fields: [sequenceStepId], references: [id], onDelete: SetNull)
+
+  /// The A/B arm actually chosen for this send. Recorded at materialisation, so
+  /// later variant edits do not rewrite history.
+  variantId String?
+  variant   SequenceStepVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  /// Sequence version this row was materialised from. A mismatch with the live
+  /// sequence means the campaign was edited mid-flight.
+  sequenceVersion Int @default(1)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// Recipient address frozen at materialisation. If the lead's email is later
+  /// corrected, the already-scheduled send is cancelled and re-materialised
+  /// rather than silently retargeted.
+  toEmail String
+
+  /// Rendered content. Frozen: personalisation is resolved once, at
+  /// materialisation, so the sent body is exactly what a preview showed and a
+  /// mid-flight template edit cannot rewrite a pending send.
+  subject  String
+  bodyHtml String
+  bodyText String
+
+  // ── Threading headers for follow-ups. See the reply-detection section. ──
+  threadId String?
+  thread   EmailThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+  /// RFC 5322 Message-ID of the message we are replying to, angle brackets
+  /// included. Sent as In-Reply-To.
+  inReplyToMessageId String?
+  /// Full References chain to send, space-separated, oldest first.
+  referencesHeader   String?
+
+  state ScheduledEmailState @default(SCHEDULED)
+
+  /// When this send becomes eligible. Already adjusted into the sending window
+  /// and the daily cap at materialisation; the worker re-checks anyway, because
+  /// state can change between materialise and claim.
+  scheduledAt DateTime @db.Timestamptz(6)
+
+  /// Set when a worker wins the SCHEDULED→SENDING race. Also the crash-recovery
+  /// marker: a SENDING row older than the lease bound is investigated, never
+  /// blindly retried (see the doc's "SENDING is not automatically retried").
+  claimedAt DateTime? @db.Timestamptz(6)
+  /// Opaque id of the worker that claimed it, for forensics.
+  claimedBy String?
+
+  sentAt DateTime? @db.Timestamptz(6)
+
+  /// Provider's message id after a successful send (Gmail `messages.send` id).
+  providerMessageId String?
+  /// RFC 5322 Message-ID header of the message we sent. Generated BY US before
+  /// the send so a duplicate-detection check and threading both work even if the
+  /// provider response is lost.
+  rfcMessageId      String?
+  providerThreadId  String?
+
+  attemptCount Int     @default(0)
+  lastError    String?
+  /// True when the failure is permanent (5xx SMTP, invalid recipient) and no
+  /// retry should be attempted.
+  permanentFailure Boolean @default(false)
+
+  cancelledAt     DateTime?             @db.Timestamptz(6)
+  cancelledReason EnrollmentStopReason?
+
+  /// Global dedup key, e.g. "campaign_step:<campaignLeadId>:<stepId>:v<version>".
+  /// Unique across the table. Belt AND braces with the composite unique below:
+  /// this one also covers WARMUP and MANUAL sends, which have no campaignLeadId.
+  dedupeKey String
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  messages EmailMessage[]
+  events   EmailEvent[]
+  jobs     Job[]
+
+  /// ── THE double-send guarantee ──
+  /// One row per (enrollment, step). A retried scheduler tick, a duplicated job,
+  /// or two workers racing all collide here and the second insert fails with
+  /// 23505. Nullable columns make this constraint inert for WARMUP/MANUAL rows,
+  /// which is why `dedupeKey` is also globally unique.
+  @@unique([campaignLeadId, sequenceStepId])
+  @@unique([dedupeKey])
+  /// Serves the worker's "what is due" scan. A PARTIAL index on
+  /// (scheduledAt) WHERE state = 'SCHEDULED' is added in migration SQL; it is
+  /// far smaller than this one because SENT rows dominate the table forever.
+  @@index([state, scheduledAt])
+  @@index([emailAccountId, state, scheduledAt])
+  @@index([campaignId, state])
+  @@index([campaignLeadId])
+  @@index([workspaceId, state])
+  @@index([leadId])
+  @@index([threadId])
+  @@index([rfcMessageId])
+  @@index([providerMessageId])
+  @@index([sequenceStepId])
+  @@index([variantId])
+}
+
+/// A rewritten link in an outbound email, so clicks can be attributed. Stored
+/// rather than encoded in the URL because we must not put a signed blob
+/// containing lead ids in a link a recipient can forward.
+model TrackingLink {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  /// Short random token appearing in the redirect URL. Globally unique because
+  /// the redirect endpoint has no session and therefore no workspace context —
+  /// the token IS the lookup key, and it is unguessable.
+  token String @unique
+
+  scheduledEmailId String
+  /// Deliberately NOT a Prisma relation with a cascade: see the doc. The row is
+  /// kept if the send is purged so an old click still resolves to a 302 instead
+  /// of a 404 in a recipient's browser.
+  originalUrl      String
+
+  clickCount  Int       @default(0)
+  firstClickAt DateTime? @db.Timestamptz(6)
+  lastClickAt  DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([workspaceId])
+  @@index([scheduledEmailId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIL STORAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A conversation as the provider sees it, scoped to one mailbox. One provider
+/// thread in two connected mailboxes is TWO rows — each mailbox has its own copy,
+/// its own read state, and its own provider ids. Merging them would be wrong.
+model EmailThread {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// Gmail `threadId`. The primary association key when present — Gmail's own
+  /// threading is better than anything we would reimplement.
+  providerThreadId String?
+
+  /// Fallback association key for providers with no thread id: the normalised
+  /// Message-ID of the conversation root (from References[0], or the first
+  /// message's own Message-ID).
+  rootMessageId String?
+
+  subject String?
+  /// Subject with `Re:`/`Fwd:`/`AW:`/`RE :` prefixes stripped and whitespace
+  /// collapsed. Last-resort association signal, and the grouping key in search.
+  normalizedSubject String?
+
+  /// Denormalised for the inbox list: avoids joining EmailMessage to render a row.
+  lastMessageAt        DateTime  @db.Timestamptz(6)
+  lastMessagePreview   String?
+  lastMessageDirection MessageDirection @default(OUTBOUND)
+  messageCount         Int       @default(0)
+
+  /// Distinct participant addresses, lowercased. Array so the inbox can filter
+  /// by participant with a GIN index instead of a join.
+  participants String[] @default([])
+
+  isRead     Boolean @default(true)
+  isArchived Boolean @default(false)
+  isStarred  Boolean @default(false)
+  /// Our own spam marker, set when the provider tells us or a human says so. Not
+  /// a claim about inbox placement at the recipient's end, which we cannot see.
+  isSpam     Boolean @default(false)
+
+  /// Attribution to outreach. All nullable: most threads in a real mailbox have
+  /// nothing to do with a campaign.
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation("EmailThreadCampaignLead", fields: [campaignLeadId], references: [id], onDelete: SetNull)
+
+  /// Set once a message on this thread was classified HUMAN_REPLY. Denormalised
+  /// so the inbox "replies" filter is an index lookup, not a subquery.
+  hasHumanReply   Boolean   @default(false)
+  firstReplyAt    DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  messages        EmailMessage[]
+  scheduledEmails ScheduledEmail[]
+  events          EmailEvent[]
+  tasks           Task[]
+  notes           Note[]
+  opportunities   Opportunity[]
+  aiAnalyses      AIAnalysis[]
+  primaryForCampaignLeads CampaignLead[] @relation("CampaignLeadPrimaryThread")
+
+  /// One row per provider thread per mailbox. Scoped by emailAccountId, which is
+  /// itself workspace-scoped, so this satisfies the no-bare-global rule.
+  @@unique([emailAccountId, providerThreadId])
+  /// THE inbox list query: one mailbox, unarchived, newest first.
+  @@index([emailAccountId, isArchived, lastMessageAt(sort: Desc)])
+  /// Workspace-wide unified inbox across mailboxes.
+  @@index([workspaceId, isArchived, lastMessageAt(sort: Desc)])
+  /// Unread filter.
+  @@index([emailAccountId, isRead, lastMessageAt(sort: Desc)])
+  /// "Replies" filter and reply-rate reporting.
+  @@index([workspaceId, hasHumanReply, lastMessageAt(sort: Desc)])
+  @@index([campaignLeadId])
+  @@index([leadId])
+  @@index([campaignId])
+  /// Association fallback lookups.
+  @@index([emailAccountId, rootMessageId])
+  @@index([workspaceId, normalizedSubject])
+}
+
+/// One email in a thread, inbound or outbound. Bodies are stored because the
+/// inbox must work offline from the provider and because reply classification
+/// re-reads them.
+model EmailMessage {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  threadId String
+  thread   EmailThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  direction MessageDirection
+
+  /// Provider's message id (Gmail `messages.id`). Unique per mailbox, and the
+  /// idempotency key that makes re-running a sync a no-op.
+  providerMessageId String
+
+  /// RFC 5322 `Message-ID` header, angle brackets stripped, lowercased. The
+  /// portable identity of the message across mailboxes and providers.
+  rfcMessageId String?
+
+  /// RFC 5322 `In-Reply-To`, normalised the same way. Single value: when a client
+  /// sends several, we keep the last, which is the immediate parent.
+  inReplyTo String?
+
+  /// Full `References` chain, normalised, oldest first. Array so a reply can be
+  /// matched against ANY of our sent Message-IDs with an array-overlap query —
+  /// necessary because forwarding and mailing lists reorder and truncate chains.
+  references String[] @default([])
+
+  fromEmail String
+  fromName  String?
+  /// Lowercased, display names stripped.
+  toEmails  String[] @default([])
+  ccEmails  String[] @default([])
+  bccEmails String[] @default([])
+  replyTo   String?
+
+  subject String?
+  snippet String?
+  bodyHtml String?
+  bodyText String?
+
+  hasAttachments Boolean @default(false)
+  /// `[{ filename, mimeType, sizeBytes, providerAttachmentId }]`. Attachment
+  /// BYTES are not stored — they are fetched on demand from the provider.
+  attachments    Json?
+
+  /// Provider labels (Gmail label ids/names), verbatim.
+  labels String[] @default([])
+
+  /// Selected raw headers we need and must not lose: Auto-Submitted,
+  /// X-Autoreply, Precedence, List-Unsubscribe, Return-Path, Authentication-
+  /// Results. Not the full header block — that is large and mostly noise.
+  headers Json?
+
+  classification MessageClassification @default(UNCLASSIFIED)
+  /// True when classification came from an AI call rather than header/pattern
+  /// rules. Lets us re-run AI without re-running deterministic decisions.
+  classifiedByAi Boolean @default(false)
+  classifiedAt   DateTime? @db.Timestamptz(6)
+
+  bounceType BounceType @default(NONE)
+  /// Parsed DSN status, e.g. "5.1.1".
+  bounceCode String?
+  /// The address that actually bounced, from the DSN body. NOT the DSN's From
+  /// (which is mailer-daemon) — that distinction is the whole trick to bounce
+  /// attribution.
+  bouncedRecipient String?
+
+  /// Which outbound send this message answers, when we could determine it.
+  scheduledEmailId String?
+  scheduledEmail   ScheduledEmail? @relation(fields: [scheduledEmailId], references: [id], onDelete: SetNull)
+
+  /// Enrollment this message is attributed to. SetNull, not Cascade: deleting a
+  /// campaign must never delete a real email out of a customer's mailbox.
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: SetNull)
+
+  /// Provider timestamp (Gmail internalDate). NOT the Date header, which senders
+  /// routinely get wrong or backdate.
+  sentAt DateTime @db.Timestamptz(6)
+
+  isRead Boolean @default(false)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  events     EmailEvent[]
+  aiAnalyses AIAnalysis[]
+  tasks      Task[]
+
+  /// Sync idempotency: re-fetching a message is an upsert, never a duplicate.
+  @@unique([emailAccountId, providerMessageId])
+  /// Thread detail view, chronological.
+  @@index([threadId, sentAt])
+  @@index([workspaceId, sentAt(sort: Desc)])
+  /// Reply attribution: "is there an inbound message whose references contain a
+  /// Message-ID we sent". A GIN index on `references` is added in migration SQL.
+  @@index([emailAccountId, rfcMessageId])
+  @@index([emailAccountId, inReplyTo])
+  /// Inbound processing queue scan and the reply-rate rollup.
+  @@index([workspaceId, direction, classification, sentAt(sort: Desc)])
+  @@index([scheduledEmailId])
+  @@index([campaignLeadId])
+  @@index([emailAccountId, direction, sentAt(sort: Desc)])
+  @@index([workspaceId, bounceType])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EVENTS — append-only. The source of truth for every metric.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Immutable fact: something happened to one email at one instant. UPDATE and
+/// DELETE are revoked at the database level. BigInt identity, not cuid: this is
+/// the highest-volume table in the system and it is only ever appended to and
+/// aggregated, never looked up by an externally-shared id.
+model EmailEvent {
+  id BigInt @id @default(autoincrement())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  type EmailEventType
+
+  /// Every dimension analytics slices by is denormalised onto the row. This is
+  /// deliberate: a rollup must not join five tables, and the facts must survive
+  /// a campaign edit or a mailbox soft-delete unchanged.
+  campaignId     String?
+  campaign       Campaign?     @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: SetNull)
+  sequenceStepId String?
+  sequenceStep   SequenceStep? @relation(fields: [sequenceStepId], references: [id], onDelete: SetNull)
+  variantId      String?
+  variant        SequenceStepVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?         @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  emailAccountId String?
+  emailAccount   EmailAccount? @relation(fields: [emailAccountId], references: [id], onDelete: SetNull)
+  scheduledEmailId String?
+  scheduledEmail   ScheduledEmail? @relation(fields: [scheduledEmailId], references: [id], onDelete: SetNull)
+  threadId       String?
+  thread         EmailThread?  @relation(fields: [threadId], references: [id], onDelete: SetNull)
+  emailMessageId String?
+  emailMessage   EmailMessage? @relation(fields: [emailMessageId], references: [id], onDelete: SetNull)
+
+  /// When the fact happened (not when we recorded it). For OPENED this is the
+  /// pixel request time, which can be long after the real open, or never.
+  occurredAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Type-specific payload: `{ url }` for CLICKED, `{ code, dsn }` for BOUNCED,
+  /// `{ reason }` for FAILED. Never a full email body.
+  metadata Json?
+
+  /// OPEN/CLICK context. Coarse only: we do not build a profile of recipients.
+  userAgent String?
+  ipAddress String?
+  /// True when the open/click looks like a scanner or prefetch (Google Image
+  /// Proxy immediately after send, known security-appliance UAs). Excluded from
+  /// headline rates — the alternative is reporting numbers we know are inflated.
+  isBot     Boolean @default(false)
+
+  /// Set for the FIRST event of its type on a scheduledEmail. Lets unique-open
+  /// and unique-click rates be computed with a plain filtered COUNT instead of a
+  /// DISTINCT over the whole table.
+  isFirstForSend Boolean @default(false)
+
+  /// Optional idempotency key. Set for provider-sourced facts that may be
+  /// delivered twice (a webhook redelivery, a re-synced bounce). Left null for
+  /// opens/clicks, which are legitimately repeatable.
+  dedupeKey String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Blocks double-counting a redelivered provider fact.
+  @@unique([dedupeKey])
+  /// ── Aggregation paths. Leading dimension, then type, then time. ──
+  @@index([campaignId, type, occurredAt])
+  @@index([sequenceStepId, type, occurredAt])
+  @@index([variantId, type, occurredAt])
+  @@index([emailAccountId, type, occurredAt])
+  @@index([workspaceId, type, occurredAt])
+  @@index([campaignLeadId, type])
+  @@index([leadId, occurredAt(sort: Desc)])
+  @@index([scheduledEmailId, type])
+  @@index([threadId])
+  @@index([emailMessageId])
+  /// Time-series charts across a whole workspace.
+  @@index([workspaceId, occurredAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CRM
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Task {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+
+  status   TaskStatus   @default(OPEN)
+  priority TaskPriority @default(NORMAL)
+
+  /// Local calendar intent (a task is "due Tuesday", not "due at 09:00Z"), but
+  /// stored as an instant computed in the assignee's timezone. Rendering converts
+  /// back. Storing a naive date here would break the moment someone travels.
+  dueAt DateTime? @db.Timestamptz(6)
+
+  completedAt DateTime? @db.Timestamptz(6)
+
+  assigneeUserId String?
+  assignee       User?   @relation("TaskAssignee", fields: [assigneeUserId], references: [id], onDelete: SetNull)
+
+  createdByUserId String?
+  createdBy       User?   @relation("TaskCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  threadId String?
+  thread   EmailThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  emailMessageId String?
+  emailMessage   EmailMessage? @relation(fields: [emailMessageId], references: [id], onDelete: SetNull)
+
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// "My open tasks, soonest first."
+  @@index([workspaceId, assigneeUserId, status, dueAt])
+  @@index([workspaceId, status, dueAt])
+  @@index([leadId])
+  @@index([opportunityId])
+  @@index([threadId])
+}
+
+model Note {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  body String
+
+  authorUserId String?
+  author       User?   @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  threadId String?
+  thread   EmailThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([leadId, createdAt(sort: Desc)])
+  @@index([opportunityId, createdAt(sort: Desc)])
+  @@index([threadId])
+  @@index([authorUserId])
+}
+
+/// A deal in the pipeline, normally created from a positive reply.
+model Opportunity {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name String
+
+  stage OpportunityStage @default(NEW)
+
+  /// Decimal, never Float — money must not accumulate binary rounding error.
+  /// Nullable because a lead can be qualified before a number exists.
+  value    Decimal? @db.Decimal(14, 2)
+  /// ISO 4217. No FX conversion is performed; totals are reported per currency.
+  currency String   @default("USD")
+
+  /// 0-100. Integer: a probability with decimals is false precision here.
+  probability Int @default(0)
+
+  expectedCloseAt DateTime? @db.Timestamptz(6)
+  closedAt        DateTime? @db.Timestamptz(6)
+  /// Free text on LOST.
+  lostReason      String?
+
+  ownerUserId String?
+  owner       User?   @relation("OpportunityOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  /// Attribution: which campaign produced this deal.
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: SetNull)
+
+  threadId String?
+  thread   EmailThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  /// Manual ordering within a pipeline column (drag and drop).
+  position Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  tasks      Task[]
+  notes      Note[]
+  activities Activity[]
+
+  /// The pipeline board query: one column, ordered.
+  @@index([workspaceId, stage, position])
+  @@index([workspaceId, ownerUserId, stage])
+  @@index([leadId])
+  @@index([campaignId])
+  @@index([threadId])
+  @@index([campaignLeadId])
+}
+
+/// Human-facing timeline. A DERIVED, presentational log — not an audit trail and
+/// not an analytics source. EmailEvent is the fact log; this is what a salesperson
+/// reads on a lead page, and it is allowed to be lossy.
+model Activity {
+  id BigInt @id @default(autoincrement())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  type ActivityType
+
+  /// Pre-rendered one-line summary. Denormalised so the timeline needs no joins
+  /// and stays readable after the referenced row is gone.
+  summary String
+
+  metadata Json?
+
+  /// Null when the system acted.
+  actorUserId String?
+  actor       User?   @relation("ActivityActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: SetNull)
+
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  occurredAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([leadId, occurredAt(sort: Desc)])
+  @@index([workspaceId, occurredAt(sort: Desc)])
+  @@index([opportunityId, occurredAt(sort: Desc)])
+  @@index([campaignLeadId])
+  @@index([actorUserId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPERIMENTS (A/B)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A/B test over the variants of ONE email step. Deliberately narrow: multi-step
+/// or multi-variate testing over a whole sequence needs traffic volumes a cold
+/// email campaign does not have, and reporting it honestly would be impossible.
+model Experiment {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  sequenceStepId String
+  sequenceStep   SequenceStep @relation(fields: [sequenceStepId], references: [id], onDelete: Cascade)
+
+  name String
+
+  /// The metric the readout reports on: "reply" | "open" | "click". Reply is the
+  /// default because open rates are unreliable (see the doc's tracking caveats).
+  primaryMetric String @default("reply")
+
+  /// Minimum sends per arm before ANY comparative claim is shown. Below it the UI
+  /// shows the raw counts and explicitly says the result is not conclusive.
+  minSamplePerArm Int @default(100)
+
+  startedAt DateTime? @db.Timestamptz(6)
+  endedAt   DateTime? @db.Timestamptz(6)
+
+  /// Variant label declared the winner by a human. We do not auto-promote.
+  winnerVariantLabel String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  arms ExperimentArm[]
+
+  /// One LIVE experiment per step is enforced by a PARTIAL unique index in
+  /// migration SQL (`WHERE "endedAt" IS NULL`); a plain unique here would forbid
+  /// ever running a second test on the same step.
+  @@index([sequenceStepId])
+  @@index([workspaceId, campaignId])
+}
+
+/// Cached per-arm counters for an experiment. Recomputed from EmailEvent by the
+/// ROLLUP_ANALYTICS job; never incremented as the authoritative record.
+model ExperimentArm {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  experimentId String
+  experiment   Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  variantId String
+  variant   SequenceStepVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  sentCount    Int @default(0)
+  openedCount  Int @default(0)
+  clickedCount Int @default(0)
+  repliedCount Int @default(0)
+  bouncedCount Int @default(0)
+  /// Distinct leads, for rate denominators.
+  uniqueOpenedCount  Int @default(0)
+  uniqueClickedCount Int @default(0)
+
+  /// Two-proportion z-test p-value against the control arm. Nullable and only
+  /// populated once both arms clear `minSamplePerArm`. Decimal, not Float: it is
+  /// displayed to users and must round predictably.
+  pValue Decimal? @db.Decimal(6, 5)
+
+  computedAt DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([experimentId, variantId])
+  @@index([variantId])
+  @@index([workspaceId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One AI inference, stored with its model, version, and confidence. Polymorphic
+/// by (targetType, targetId) PLUS typed nullable FKs for the targets we actually
+/// query by, so the common lookups stay indexed while the table stays open.
+model AIAnalysis {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  targetType AIAnalysisTarget
+  /// The target row's id. Redundant with the typed FKs below by design: it makes
+  /// "all analyses for X" answerable without knowing X's type.
+  targetId   String
+
+  kind AIAnalysisKind
+
+  emailMessageId String?
+  emailMessage   EmailMessage? @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  threadId String?
+  thread   EmailThread? @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  campaignLeadId String?
+  campaignLead   CampaignLead? @relation(fields: [campaignLeadId], references: [id], onDelete: Cascade)
+
+  /// Exact model id, e.g. "claude-sonnet-5". Stored so a classification can be
+  /// re-evaluated when the model changes rather than silently compared across
+  /// model generations.
+  model String
+  /// Our prompt template version, e.g. "reply-classify.v3".
+  promptVersion String
+
+  /// Validated against a zod schema before insert. Shape depends on `kind`.
+  output Json
+
+  // ── Promoted fields for the common REPLY_CLASSIFICATION case, so the inbox
+  // can filter on them without reading JSON. ──
+  classification MessageClassification?
+  sentiment      SentimentLabel?
+  /// Model self-reported confidence 0-1. Decimal so it renders as "0.87" every
+  /// time, and because we display it next to a claim.
+  confidence     Decimal?               @db.Decimal(4, 3)
+  /// One-line human-readable result for the timeline.
+  summary        String?
+
+  inputTokens  Int?
+  outputTokens Int?
+  latencyMs    Int?
+
+  /// True when a human accepted this output (e.g. sent the drafted reply).
+  acceptedByHuman Boolean   @default(false)
+  acceptedAt      DateTime? @db.Timestamptz(6)
+  /// Set when a human explicitly corrected the label. Training signal, and the
+  /// value the UI shows in preference to `classification`.
+  humanCorrection MessageClassification?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// One analysis per (target, kind, prompt version). Re-running the same prompt
+  /// on the same message is an upsert, so a retried job cannot burn tokens twice
+  /// or produce two contradictory labels.
+  @@unique([targetType, targetId, kind, promptVersion])
+  @@index([workspaceId, kind, createdAt(sort: Desc)])
+  @@index([emailMessageId])
+  @@index([threadId])
+  @@index([leadId])
+  @@index([campaignId])
+  @@index([campaignLeadId])
+  @@index([workspaceId, classification])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBHOOKS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Raw inbound provider notification, persisted BEFORE any processing. Gmail
+/// Pub/Sub push has an aggressive ack deadline and redelivers freely, so we
+/// durably record, ack fast, and process from a job. The payload is untrusted
+/// data, never instructions.
+model WebhookEvent {
+  id String @id @default(cuid())
+
+  /// Nullable: an unmatched payload (mailbox disconnected, wrong project) has no
+  /// workspace. Second documented exception to the non-null rule, alongside
+  /// AuditLog.
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  emailAccountId String?
+  emailAccount   EmailAccount? @relation(fields: [emailAccountId], references: [id], onDelete: SetNull)
+
+  provider EmailProvider
+
+  /// Pub/Sub message id, or a hash of the body when the provider gives us none.
+  /// Globally unique: it is the provider's namespace, not ours, and it is what
+  /// makes redelivery a no-op.
+  providerEventId String @unique
+
+  /// Verbatim decoded payload. Retained for a bounded window (see MAINTENANCE) —
+  /// long enough to debug, not forever.
+  payload Json
+
+  state WebhookState @default(RECEIVED)
+
+  attemptCount Int     @default(0)
+  lastError    String?
+
+  receivedAt  DateTime  @default(now()) @db.Timestamptz(6)
+  processedAt DateTime? @db.Timestamptz(6)
+
+  @@index([state, receivedAt])
+  @@index([workspaceId, receivedAt(sort: Desc)])
+  @@index([emailAccountId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUEUE — the locked Postgres-backed job queue.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Durable job. Leased with `SELECT … FOR UPDATE SKIP LOCKED`; see
+/// docs/architecture/01-database.md §7 for the exact SQL.
+///
+///   PENDING/RETRYING ──lease──▶ RUNNING ──ok──▶ SUCCEEDED
+///        ▲                          │
+///        └──── attempt < max ───────┴──fail──▶ DEAD (attempt = max)
+///        ▲                          │
+///        └──── lease expired ───────┘        (recovered by a sweeper)
+///
+/// A job row is intent, not a guarantee of once-only execution: at-least-once
+/// delivery is the contract. Exactly-once EFFECT comes from the target row's own
+/// state guard (ScheduledEmail.state) and from `dedupeKey` here.
+model Job {
+  id BigInt @id @default(autoincrement())
+
+  /// Non-null. Every job belongs to a tenant — including MAINTENANCE, which is
+  /// enqueued per workspace so one tenant's backlog cannot starve another's.
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  type JobType
+
+  /// Handler input. Small by contract: ids, not payloads. A job carrying a
+  /// rendered email body would bloat the hottest table in the system.
+  payload Json @default("{}")
+
+  state JobState @default(PENDING)
+
+  /// Higher runs first. Sends outrank rollups so an analytics backlog can never
+  /// delay a scheduled send.
+  priority Int @default(0)
+
+  /// Earliest execution time. This is the delayed-job mechanism, and after a
+  /// failure it is set to the backoff deadline.
+  runAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Set on lease. A RUNNING row past this instant is presumed abandoned and is
+  /// returned to PENDING by the lease-expiry sweeper.
+  leaseExpiresAt DateTime? @db.Timestamptz(6)
+  /// Worker identity holding the lease, for observability.
+  lockedBy       String?
+  lockedAt       DateTime? @db.Timestamptz(6)
+
+  attempt     Int @default(0)
+  maxAttempts Int @default(5)
+
+  /// THE double-enqueue guard. Format: "<type>:<stable-natural-key>", e.g.
+  /// "SEND_SCHEDULED_EMAIL:<scheduledEmailId>" or
+  /// "MAILBOX_SYNC:<emailAccountId>:<historyId>". Globally unique and NOT
+  /// nullable: every job must be able to name itself, because a job that cannot
+  /// be deduplicated is a job that can double-send.
+  ///
+  /// For legitimately repeatable work (a periodic tick) the key includes the
+  /// period bucket, e.g. "SCHEDULER_TICK:<campaignId>:2026-08-31T14:05".
+  dedupeKey String
+
+  lastError String?
+  /// Truncated stack for the dead-letter view. Never a secret.
+  lastErrorStack String?
+
+  /// Set when the job reached DEAD. Drives the dead-letter queue UI.
+  failedAt DateTime? @db.Timestamptz(6)
+  /// Incremented when an operator replays a DEAD job. Distinguishes "retried by
+  /// the system" from "a human pressed retry".
+  replayCount Int @default(0)
+
+  /// Direct FK for the dominant job type, so cancelling a scheduled email can
+  /// cancel its job without a JSON query.
+  scheduledEmailId String?
+  scheduledEmail   ScheduledEmail? @relation(fields: [scheduledEmailId], references: [id], onDelete: Cascade)
+
+  startedAt   DateTime? @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+  /// Duration of the last attempt. Cheap p95 observability without a metrics store.
+  durationMs  Int?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// Idempotent enqueue: a second insert with the same key raises 23505 and the
+  /// caller treats that as success.
+  @@unique([dedupeKey])
+  /// THE lease query index. A PARTIAL variant limited to leasable states is
+  /// added in migration SQL and is the one that actually gets used, because
+  /// SUCCEEDED rows dominate the table between maintenance sweeps.
+  @@index([state, runAt, priority(sort: Desc)])
+  /// Lease-expiry sweeper.
+  @@index([state, leaseExpiresAt])
+  /// Dead-letter view and per-tenant queue depth.
+  @@index([workspaceId, state, createdAt(sort: Desc)])
+  @@index([type, state])
+  @@index([scheduledEmailId])
+}
