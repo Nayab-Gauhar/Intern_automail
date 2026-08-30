@@ -41,14 +41,22 @@ const REDACT_KEYS = new Set([
   'htmlBody',
 ])
 
-function redact(value: unknown, depth = 0): unknown {
-  if (depth > 4 || value == null) return value
-  if (Array.isArray(value)) return value.slice(0, 20).map((v) => redact(v, depth + 1))
+function redact(value: unknown, depth = 0, seen: WeakSet<object> = new WeakSet()): unknown {
+  if (value == null) return value
 
   if (typeof value === 'object') {
+    // A cyclic payload must not crash the caller: logging is never allowed to take
+    // a request down, and JSON.stringify throws on a cycle. Depth-limiting alone
+    // does not help, since the value returned at the limit is still the cycle.
+    if (seen.has(value)) return '[circular]'
+    if (depth > 4) return '[truncated]'
+    seen.add(value)
+
+    if (Array.isArray(value)) return value.slice(0, 20).map((v) => redact(v, depth + 1, seen))
+
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = REDACT_KEYS.has(k) ? '[redacted]' : redact(v, depth + 1)
+      out[k] = REDACT_KEYS.has(k) ? '[redacted]' : redact(v, depth + 1, seen)
     }
     return out
   }
