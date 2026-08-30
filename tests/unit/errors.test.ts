@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   AppError,
+  type ErrorCode,
   NotFoundError,
   UnauthorizedError,
   ForbiddenError,
@@ -22,7 +23,9 @@ import {
  */
 
 describe('status and code mapping', () => {
-  test.each([
+  // Typed explicitly: test.each widens a literal tuple to string, which no longer
+  // satisfies toBe(expected: ErrorCode).
+  const CASES: [string, AppError, number, ErrorCode][] = [
     ['NotFoundError', new NotFoundError(), 404, 'NOT_FOUND'],
     ['UnauthorizedError', new UnauthorizedError(), 401, 'UNAUTHORIZED'],
     ['ForbiddenError', new ForbiddenError(), 403, 'FORBIDDEN'],
@@ -30,9 +33,11 @@ describe('status and code mapping', () => {
     ['ConflictError', new ConflictError(), 409, 'CONFLICT'],
     ['RateLimitedError', new RateLimitedError(30), 429, 'RATE_LIMITED'],
     ['UnavailableError', new UnavailableError(), 503, 'UNAVAILABLE'],
-  ])('%s maps to %i / %s', (_n, err, status, code) => {
-    expect((err as AppError).status).toBe(status)
-    expect((err as AppError).code).toBe(code)
+  ]
+
+  test.each(CASES)('%s maps to %i / %s', (_n, err, status, code) => {
+    expect(err.status).toBe(status)
+    expect(err.code).toBe(code)
   })
 
   test('ProviderError is a 502 and carries its retryability', () => {
