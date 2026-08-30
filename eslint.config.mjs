@@ -43,17 +43,24 @@ export default tseslint.config(
     files: ['src/**/*.{ts,tsx}'],
     ignores: ['src/modules/**/repo.ts', 'src/lib/db.ts'],
     rules: {
-      'no-restricted-imports': [
+      // The base rule cannot distinguish a type-only import, so use the
+      // typescript-eslint variant with allowTypeImports. The intent is to block
+      // DATABASE ACCESS outside repo.ts, not to ban the generated enum types:
+      // `import type { Role }` is erased at compile time and touches nothing.
+      'no-restricted-imports': 'off',
+      '@typescript-eslint/no-restricted-imports': [
         'error',
         {
           paths: [
             {
               name: '@prisma/client',
+              allowTypeImports: true,
               message:
-                'Prisma may only be imported from src/modules/*/repo.ts or src/lib/db.ts. Go through the module public API.',
+                'Prisma may only be imported from src/modules/*/repo.ts or src/lib/db.ts. Go through the module public API. (Type-only imports are allowed.)',
             },
             {
               name: '@/lib/db',
+              allowTypeImports: true,
               message:
                 'Import the db client only in a repo.ts. Callers use the module public API (index.ts).',
             },

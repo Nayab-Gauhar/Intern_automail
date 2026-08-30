@@ -71,50 +71,50 @@ The models exist. What is missing is the SQL Prisma cannot express, and it is
 load-bearing rather than an optimisation. All of it belongs in one migration,
 `prisma/migrations/*_jobs_engine_indexes/migration.sql`.
 
-```sql
--- ── 1. THE lease index. Partial, so it stays small while SUCCEEDED rows
---       dominate the table. priority DESC because higher runs first.
-CREATE INDEX IF NOT EXISTS job_leasable_idx
-  ON "Job" (priority DESC, "runAt" ASC)
-  WHERE state IN ('PENDING', 'RETRYING');
+**Ownership.** Doc 01 §6 already defines two of these and this document does not
+redefine them: `Job_leasable_idx` (partial, on `("runAt", "priority" DESC)`) and
+`ScheduledEmail_due_idx` (partial, on `("scheduledAt")`). Use those names. The
+indexes below are the ones no other doc claims.
 
--- ── 2. Lease-expiry sweep.
+One note on `Job_leasable_idx`: doc 01 orders it `("runAt", "priority" DESC)`
+while the lease query (§4.2) orders `priority DESC, "runAt"`. Those disagree, so
+the planner sorts rather than walking the index in order. The fix is one of the
+two, not both — see §16 item 11. Everything else here is unaffected.
+
+```sql
+-- ── 1. Lease-expiry sweep.
 CREATE INDEX IF NOT EXISTS job_lease_expiry_idx
   ON "Job" ("leaseExpiresAt")
   WHERE state = 'RUNNING';
 
--- ── 3. Dead-letter console, grouped by type.
+-- ── 2. Dead-letter console, grouped by type.
 CREATE INDEX IF NOT EXISTS job_dead_idx
   ON "Job" (type, "failedAt" DESC)
   WHERE state = 'DEAD';
 
--- ── 4. The scheduler's "what is due" scan.
-CREATE INDEX IF NOT EXISTS scheduled_email_due_idx
-  ON "ScheduledEmail" ("scheduledAt" ASC)
-  WHERE state = 'SCHEDULED';
-
--- ── 5. At most ONE outstanding scheduled email per enrollment. This is what
+-- ── 3. At most ONE outstanding scheduled email per enrollment. This is what
 --       makes "materialise only the next step" safe, and it turns a
 --       double-running scheduler from a data incident into a rejected INSERT.
 CREATE UNIQUE INDEX IF NOT EXISTS scheduled_email_one_outstanding_uq
   ON "ScheduledEmail" ("campaignLeadId")
   WHERE state IN ('SCHEDULED', 'SENDING') AND "campaignLeadId" IS NOT NULL;
 
--- ── 6. Crash-recovery sweep: SENDING rows of unknown outcome.
+-- ── 4. Crash-recovery sweep: SENDING rows of unknown outcome.
 CREATE INDEX IF NOT EXISTS scheduled_email_stuck_idx
   ON "ScheduledEmail" ("claimedAt")
   WHERE state = 'SENDING';
 
--- ── 7. Due-enrollment scan for the scheduler tick.
+-- ── 5. Due-enrollment scan for the scheduler tick.
 CREATE INDEX IF NOT EXISTS campaign_lead_due_idx
   ON "CampaignLead" ("nextStepAt" ASC)
   WHERE state IN ('ACTIVE', 'WAITING');
 ```
 
-Index 5 is the single most valuable line in the migration. Review it with
-`EXPLAIN` and confirm indexes 1 and 4 produce an index scan with no sort node —
-if a sort appears, the `ORDER BY` direction does not match the index and the
-lease query will degrade under load rather than fail visibly.
+Index 3 (`scheduled_email_one_outstanding_uq`) is the single most valuable line in
+the migration: it turns a double-running scheduler from a data incident into a
+rejected `INSERT`. Review the lease and due queries with `EXPLAIN` and confirm no
+sort node appears; if one does, the `ORDER BY` does not match the index and the
+queue degrades under load rather than failing visibly.
 
 ### 2.1 The one column this phase must add
 
@@ -236,11 +236,15 @@ src/modules/sending/
   windows.ts      # pure: window intersection + tz math (§9) — unit-tested vs DST
   pacing.ts       # pure: gap, jitter, warmup ramp (§10)
   reconcile.ts    # provider-side duplicate detection (§6.4)
-  providers/
-    types.ts      # EmailProvider interface
-    gmail.ts      # GmailProvider
-    fake.ts       # deterministic provider for tests (doc 09 §10.1)
 ```
+
+**Not owned here.** `src/modules/mailboxes/providers/**` — the `MailProvider`
+interface, `GmailProvider`, `FakeProvider`, MIME construction, and provider error
+mapping — belongs to doc 05 §1.2. This module consumes it through
+`getProvider()` from that module's public API and never imports `googleapis`
+itself. Concretely: the send handler builds no MIME and parses no Gmail error; it
+calls `provider.send(...)` and maps the returned `ProviderError` class to a
+`JobOutcome`.
 
 `worker/registry.ts` is the only place the worker touches domain code, and it
 imports module public APIs exclusively — the brief's import rules apply to the
@@ -493,8 +497,9 @@ Review notes that matter:
   CTE. Postgres rejects it with aggregates, `DISTINCT`, or a `GROUP BY`.
 * The statement may return **fewer than `LIMIT`** rows when locks are skipped.
   The loop treats that as normal, not as "queue empty".
-* `ORDER BY priority DESC, "runAt" ASC` matches `job_leasable_idx` exactly. If
-  `EXPLAIN` shows a sort node, the index is wrong, not the query.
+* `ORDER BY priority DESC, "runAt" ASC` is identical to doc 01 §6.3's lease query,
+  deliberately — there must be exactly one lease statement in the codebase. It does
+  **not** match doc 01's `Job_leasable_idx` column order; see §16 item 11.
 * There is no window in which a row is selected but not yet `RUNNING`.
 
 ### 4.3 Lease duration by duration class
@@ -752,14 +757,31 @@ before any send:
 scheduledEmail.rfcMessageId = `<${cuid()}.${scheduledEmail.id}@${sendingDomain}>`;
 ```
 
-The outgoing MIME always carries:
+The outgoing MIME carries the headers doc 05 §6.6 defines — that document owns the
+header set and this one consumes it:
 
 ```
-Message-ID: <clh7x9k2q0000.se_abc123@outreach.acme.com>
-X-IM-Scheduled-Email: se_abc123
-List-Unsubscribe: <mailto:u+token@…>, <https://…/u/token>
+Message-ID: <…@{mailbox domain}>          ← ours, committed pre-send
+X-IM-Send-Token: <22-char base64url>      ← strategy B's match key
+X-IM-Workspace:  <sha256(workspaceId)[0..16]>
+List-Unsubscribe: <mailto:…>, <https://…>
 List-Unsubscribe-Post: List-Unsubscribe=One-Click
 ```
+
+`X-IM-Send-Token` is **derived, not stored**, resolving what doc 05 §6.6 flagged as
+a conflict with an earlier draft of this file: there is no `sendToken` column and
+none is needed.
+
+```ts
+// doc 05 §6.6 — reproducible during reconciliation, unguessable without the secret
+sendToken(se) === base64url(hmacSha256(env.AUTH_SECRET, `send-token:v1:${se.id}`)).slice(0, 22)
+```
+
+Deriving it matters for reconciliation specifically: a random column would have to
+be written before the send and read back after a crash, which is the same
+bootstrapping problem the token exists to solve. An HMAC of the row id is
+recomputable from the row alone, so reconciliation works even if nothing about the
+attempt was persisted.
 
 It is **stable across attempts**, not per attempt. That is the point: it is the
 query key for asking the provider "did you already take this?".
@@ -771,19 +793,14 @@ is what gates the retry.
 
 Real constraint: **Gmail does not guarantee it preserves a caller-supplied
 `Message-ID`.** In practice it usually does for `raw` MIME, but we do not rely on
-it. On each successful send we read back what was actually stored:
+it. Doc 05 §6.7 owns the send call and already reads the stored header back,
+returning it as `SendResult.observedMessageId`; this document only consumes that
+field. `rfcMessageId` is never overwritten with the observed value — it is the
+key we will search by, and rewriting it would destroy the audit trail.
 
-```ts
-const sent = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
-const meta = await gmail.users.messages.get({
-  userId: 'me', id: sent.data.id, format: 'metadata',
-  metadataHeaders: ['Message-ID', 'X-IM-Scheduled-Email'],
-});
-```
-
-If the returned `Message-ID` differs from ours, we log
-`send.messageid_rewritten` once per mailbox per day and permanently prefer
-strategy B below for that mailbox. The system adapts instead of silently becoming
+If `observedMessageId` differs from `rfcMessageId`, we log
+`send.messageid_rewritten` once per mailbox per day and prefer strategy B below
+for that mailbox from then on. The system adapts instead of silently becoming
 unsafe.
 
 ### 6.4 Reconciliation
@@ -796,22 +813,34 @@ export type ReconcileVerdict =
   | { kind: 'inconclusive'; reason: string };
 
 export async function reconcileSend(
-  ctx: Ctx, se: ScheduledEmailRow, provider: EmailProvider,
+  ctx: Ctx, se: ScheduledEmailRow, provider: MailProvider,
 ): Promise<ReconcileVerdict>;
 ```
 
-**Strategy A — exact header search (primary).**
-`users.messages.list?q=rfc822msgid:<the id without angle brackets>` is an exact,
-indexed Gmail operator. One hit ⇒ `already_sent`. More than one ⇒ we already
-double-sent at some point; return `already_sent` with the first and log
-`send.duplicate_detected` at error level so it is investigated.
+Strategy selection is driven by the provider's declared capabilities (doc 05 §3),
+never by hardcoding Gmail: `capabilities.supportsMessageIdSearch` gates A,
+`capabilities.preservesCustomHeaders` gates B, and `capabilities.messageIdFidelity`
+plus any recorded rewrite downgrade decides which is primary.
 
-**Strategy B — bounded sent-folder scan (fallback, and primary for mailboxes
-known to rewrite Message-ID).**
-`users.messages.list?q=in:sent to:{toEmail} after:{claimedAt-10m}&maxResults=25`,
-then `messages.get(format=metadata)` on each, matching
-`X-IM-Scheduled-Email === se.id`. Gmail preserves unknown `X-` headers, so this
-is the more robust signal; it is secondary only because it costs more quota.
+**Strategy A — exact Message-ID lookup (primary).**
+`provider.findByRfcMessageId(auth, se.rfcMessageId)` — an indexed, exact server-side
+lookup, present iff `supportsMessageIdSearch`. One hit ⇒ `already_sent`. More than
+one ⇒ we already double-sent at some point; return `already_sent` with the first and
+log `send.duplicate_detected` at error level so it is investigated.
+
+**Strategy B — bounded sent-folder scan** (fallback, and primary for mailboxes known
+to rewrite `Message-ID`). List sent messages to `se.toEmail` since
+`claimedAt - 10m`, capped at 25, then fetch each and match
+`X-IM-Send-Token === sendToken(se)`. Unknown `X-` headers survive the send wherever
+`preservesCustomHeaders` is true, which makes this the more robust signal; it is
+secondary only because it costs more provider quota.
+
+**If a provider supports neither** (`supportsMessageIdSearch` and
+`preservesCustomHeaders` both false), reconciliation is impossible and the honest
+consequence must be accepted rather than designed around: for that provider a send
+whose outcome is unknown is **never retried**. It goes straight to the operator.
+Doc 05 records these capabilities per provider precisely so this decision is data,
+not a code branch someone forgets to add when SMTP lands.
 
 **Strategy C — none.** If A and B cannot run (auth revoked, 5xx, quota
 exhausted), the verdict is `inconclusive` and **we do not send.** The row stays
@@ -819,7 +848,7 @@ exhausted), the verdict is `inconclusive` and **we do not send.** The row stays
 the deliberate choice from §1: a stuck email beats a duplicate.
 
 **The indexing-lag constraint.** Gmail's search index is not synchronous with the
-send. A message accepted 3 seconds ago may not be findable by `rfc822msgid:` yet,
+send. A message accepted 3 seconds ago may not be findable by an exact id lookup yet,
 and a naive immediate reconcile would answer `not_sent` and duplicate the email —
 precisely the bug being prevented. Therefore:
 
@@ -854,8 +883,13 @@ export class TerminalError  extends AppError {}
 export class DeferError     extends AppError {}   // not a failure at all
 ```
 
+Gmail's raw error → `ProviderError` mapping is doc 05's `gmail-errors.ts` (a pure,
+exhaustively tested function). What follows is **this** module's job: mapping a
+`ProviderError` class to a queue outcome. The distinction matters — the provider
+module decides *what went wrong*, the queue decides *what to do about it*.
+
 ```ts
-// src/modules/sending/providers/gmail.ts :: classifyGmailError
+// src/modules/sending/service.ts :: outcomeForProviderError
 switch (true) {
   case status === 429:
   case status >= 500:
@@ -1090,7 +1124,7 @@ WHERE cl."campaignId" = $1
 ORDER BY cl."nextStepAt"
 LIMIT 500;
 
--- (b) due scheduled rows — served by scheduled_email_due_idx
+-- (b) due scheduled rows — served by ScheduledEmail_due_idx (doc 01 §6)
 SELECT id, "workspaceId"
 FROM "ScheduledEmail"
 WHERE state = 'SCHEDULED' AND "scheduledAt" <= now() + interval '30 seconds'
@@ -1842,7 +1876,7 @@ MEMBER. The worker dot carries a text label; status is never colour alone.
 | # | Failure | Blast radius | Detection | Recovery |
 |---|---|---|---|---|
 | 1 | Worker killed mid-job | its jobs stall ≤ `leaseSeconds` | stale `WorkerHeartbeat`; `job.lease_reclaimed` | `reclaimExpiredLeases` → `RETRYING`; sends route via reconcile (§6.4) |
-| 2 | **Crash after Gmail accepted, before commit** | one email could duplicate | row stuck `SENDING` past grace; `send.unknown_outcome` | reconcile by `rfc822msgid:` then `X-IM-Scheduled-Email`; found ⇒ `SENT`; inconclusive ⇒ stays `SENDING` for a human, **never auto-sent** |
+| 2 | **Crash after Gmail accepted, before commit** | one email could duplicate | row stuck `SENDING` past grace; `send.unknown_outcome` | reconcile by exact Message-ID lookup, then `X-IM-Send-Token`; found ⇒ `SENT`; inconclusive ⇒ stays `SENDING` for a human, **never auto-sent** |
 | 3 | All workers down | **no campaign sends at all** | `workers_alive == 0 AND jobs_leasable > 0` → page | restart; nothing is lost, `runAt` is in the past, backlog drains subject to cap and pacing |
 | 4 | Postgres unavailable | everything halts | connection errors; health check fails | jobs are durable on disk; the loop resumes. Enqueue failures surface as action errors, never silent drops |
 | 5 | Gmail 429 / `quotaExceeded` | that mailbox stalls | `mailbox.throttled_by_provider` | full-jitter backoff; `status=THROTTLED`, `throttledUntil` = local midnight; other mailboxes unaffected |
@@ -2021,3 +2055,26 @@ ergonomics or future scope.
     what this design implements. Worth confirming the UI presents it that way
     ("effective window: Mon–Fri 09:00–16:00, narrowed by ops@acme.com"), because an
     operator who sets a campaign window and sees no sends will otherwise file a bug.
+
+11. **`Job_leasable_idx` column order disagrees with the lease query (§2, §4.2).**
+    Doc 01 §6 defines the index as `("runAt", "priority" DESC)`, while doc 01 §6.3's
+    own lease query — and this document's, deliberately identical — orders
+    `priority DESC, "runAt"`. The planner cannot walk that index in the query's
+    order, so it sorts the matched set on every poll by every worker. Not incorrect,
+    but it forfeits the reason the index exists. **Recommendation:** change the
+    index to `("priority" DESC, "runAt")`, since priority is the leading sort key and
+    reordering the query instead would let a low-priority rollup jump ahead of a
+    send. One-line fix, worth making before there is volume.
+
+12. **Two documents now contain the lease SQL (§4.2 and doc 01 §6.3).** They agree
+    today. They will not stay agreed if either is edited alone, and a divergence here
+    is a correctness bug that no test would obviously catch. **Recommendation:** doc
+    01 keeps it as the schema-level illustration, this document owns the
+    implementation in `src/modules/jobs/repo.ts`, and there is exactly one such
+    function in the codebase — every worker and the tick endpoint call it.
+
+13. **Interface naming, resolved.** Doc 05 §1.1 is right that `MailProvider` is the
+    correct name, since `EmailProvider` is already a Prisma enum and sharing the name
+    costs an import alias in every file touching both. This document has been updated;
+    no open question remains. Recorded here only so the fix is not re-litigated.
+

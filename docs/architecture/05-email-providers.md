@@ -10,7 +10,7 @@
 >
 > **Subordinate to:** `00-product-brief.md` and `prisma/schema.prisma`. Where a
 > sibling doc and the schema disagree, the schema wins and the disagreement is
-> recorded in §18.
+> recorded in §17.
 
 ---
 
@@ -51,7 +51,7 @@ import type { MailProvider }  from '@/modules/mailboxes/providers/types';
 
 `09-deployment-and-testing.md` already says `MailProvider`. `06` line 363 says
 `EmailProvider`. **`MailProvider` is correct**; `06` needs the one-word fix
-(§18.1).
+(§17.1).
 
 ### 1.2 Files owned by this document
 
@@ -155,7 +155,7 @@ export type RefreshedCredentials = {
   readonly accessTokenExpiresAt: Date;
   /**
    * Set only by providers that ROTATE refresh tokens. Google does not (the same
-   * refresh token keeps working). Microsoft does — see §16.1. When present the
+   * refresh token keeps working). Microsoft does — see §12. When present the
    * caller must persist it in the same transaction that persists the access
    * token, or the mailbox is bricked.
    */
@@ -202,7 +202,7 @@ export type ProviderCapabilities = {
    *  and `isArchived` are LOCAL ONLY and the UI must say so. */
   readonly supportsReadStateWriteback: boolean;
 
-  /** Indexed server-side search we can use for send reconciliation (§5.7). */
+  /** Indexed server-side search we can use for send reconciliation (`06` §6.4). */
   readonly supportsMessageIdSearch: boolean;
 
   /** True only if the provider genuinely tells us a message reached the
@@ -214,11 +214,11 @@ export type ProviderCapabilities = {
   readonly preservesCustomHeaders: boolean;
 
   /** Whether our generated `Message-ID` survives. Drives which reconciliation
-   *  strategy is primary (§5.7). */
+   *  strategy is primary (`06` §6.4, and §6.8 here). */
   readonly messageIdFidelity: MessageIdFidelity;
 
   /** Arbitrary non-`X-` headers (List-Unsubscribe) can be set. Graph's JSON
-   *  send path cannot — see §16.1. */
+   *  send path cannot — see §12. */
   readonly supportsArbitraryHeaders: boolean;
 
   /** Hard ceiling on the assembled RFC 5322 message, in bytes, before base64. */
@@ -395,7 +395,7 @@ export type SendResult = {
   /**
    * The `Message-ID` the provider actually stored, read back after send. May
    * differ from `msg.messageId`. Null when the provider gives us no way to
-   * check. Drives the per-mailbox reconciliation strategy (§5.7).
+   * check. Drives the per-mailbox reconciliation strategy (`06` §6.4, and §6.8 here).
    */
   readonly observedMessageId: string | null;
   readonly sentAt: Date;
@@ -527,7 +527,7 @@ Three things make that possible and each is load-bearing:
 - `buildOutboundHeaders` is pure and provider-independent; a provider that
   cannot honour a header drops it and says so via
   `capabilities.supportsArbitraryHeaders`, which the header builder reads to
-  decide whether `List-Unsubscribe` can be promised (§16.1).
+  decide whether `List-Unsubscribe` can be promised (§12).
 - Everything the caller persists comes from `SendResult`, whose fields are
   exactly the four `ScheduledEmail` columns that need filling.
 
@@ -701,7 +701,7 @@ test('refreshAuth on a revoked grant yields ProviderAuthRevoked, not ProviderAut
 ```
 
 The last one matters because the two errors have opposite consequences: one
-retries, the other disconnects the mailbox and emails the user (§4.8).
+retries, the other disconnects the mailbox and emails the user (§5.4).
 
 ---
 
@@ -779,7 +779,7 @@ plans a launch around a wrong assumption:
   "fixed" repeatedly by successive developers.
 
 Design consequence: nothing in the send or sync path may assume a long-lived
-refresh token. The `invalid_grant` path (§4.8) is a **routine** operation in
+refresh token. The `invalid_grant` path (§5.4) is a **routine** operation in
 development, not an exceptional one, and is exercised by a test rather than
 discovered in production.
 
@@ -847,7 +847,7 @@ Details that matter:
 
   **This table is the only new database object this document requires.** It is
   not tenant data (it holds no mail, no lead, no credential) and it is
-  deliberately not a Prisma model, so no repo can accidentally join it. §18.3
+  deliberately not a Prisma model, so no repo can accidentally join it. §17.3
   flags it for the schema owner.
 
 ### 4.4 Start route
@@ -1036,7 +1036,7 @@ All on `EmailAccount`, columns that already exist:
 The schema comment on `encryptedRefreshToken` says the envelope is
 **`base64(iv ‖ ciphertext ‖ authTag)`** in a `String` column. `09` §4.2 shows a
 `Bytes` column laid out `iv(12) ‖ tag(16) ‖ ct` on a `MailboxCredential` model
-that does not exist in the schema. **The schema wins** — see §18.2. So:
+that does not exist in the schema. **The schema wins** — see §17.2. So:
 
 ```ts
 // src/lib/crypto.ts — canonical, matching prisma/schema.prisma
@@ -1146,7 +1146,7 @@ async function refreshWithLock(ctx: Ctx, emailAccountId: string): Promise<Provid
     await repo.storeAccessTokenTx(tx, ctx, emailAccountId, {
       encryptedAccessToken: encryptSecret(fresh.accessToken).ciphertext,
       accessTokenExpiresAt: fresh.accessTokenExpiresAt,
-      // Google does not rotate refresh tokens; Microsoft does (§16.1).
+      // Google does not rotate refresh tokens; Microsoft does (§12).
       ...(fresh.rotatedRefreshToken
         ? { encryptedRefreshToken: encryptSecret(fresh.rotatedRefreshToken).ciphertext }
         : {}),
@@ -1500,7 +1500,7 @@ export function sendToken(se: { id: string }): string {
 ```
 
 Deterministic, reproducible during reconciliation, unguessable without
-`AUTH_SECRET`, and zero schema change. §18.4 flags the `06` reference.
+`AUTH_SECRET`, and zero schema change. §17.4 flags the `06` reference.
 
 `X-IM-Workspace` is hashed, not the raw id: outbound headers are visible to the
 recipient, and leaking a tenant identifier into every email is needless.
@@ -2309,7 +2309,7 @@ Product rules, all enforced (and consistent with `08` §7.1):
    filtered number we cannot audit.
 4. Open tracking is **off by default per campaign**, with the tradeoff stated at
    the toggle. `Workspace.trackOpensDefault` ships `true` in the schema; `08`
-   §7.1 requires per-campaign opt-in. **Conflict — §18.5.**
+   §7.1 requires per-campaign opt-in. **Conflict — §17.5.**
 5. Click tracking is one tier more trustworthy (a human usually clicked, though
    scanners click too) and is labelled separately rather than lumped in with
    opens.
@@ -2660,7 +2660,7 @@ and no phase-2 payoff.
 
 ## 16. Phase-2 acceptance criteria
 
-`09` §13 lists the phase-2 gate. Restated as what this document must deliver,
+`09` §12 (definition of done) lists the phase-2 gate. Restated as what this document must deliver,
 each item independently checkable:
 
 ```
