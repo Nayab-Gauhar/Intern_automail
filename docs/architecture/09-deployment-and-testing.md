@@ -798,10 +798,10 @@ campaign.launched               campaign.paused{by}             campaign.complet
 scheduler.tick.completed{campaigns,materialised,durationMs}
 scheduler.step.skipped{reason:'window'|'daily_cap'|'replied'|'unsubscribed'|'paused'}
 
-job.enqueued{type,runAt,idempotencyKey}     job.leased{type,attempt}
+job.enqueued{type,runAt,dedupeKey}          job.leased{type,attempt}
 job.succeeded{type,durationMs}              job.failed{type,attempt,willRetryAt}
-job.dead_lettered{type,attempts}            ← always error
-job.lease_expired{type}                     job.duplicate_suppressed{idempotencyKey}
+job.dead_lettered{type,attempt}             ← always error
+job.lease_expired{type}                     job.duplicate_suppressed{dedupeKey}
 
 send.attempted                  send.succeeded{providerMessageId}
 send.failed{providerStatus,classification:'transient'|'permanent'}
@@ -871,7 +871,7 @@ dashboard. Anything not on this list is a log search, not a metric.
 -- 1. QUEUE DEPTH — is the worker keeping up?
 SELECT status, count(*)
 FROM "Job"
-WHERE status IN ('PENDING','LEASED','FAILED','DEAD')
+WHERE state IN ('PENDING','RUNNING','RETRYING','DEAD')
 GROUP BY status;
 
 -- 2. OLDEST PENDING JOB AGE — the single best "is the worker alive" signal.
@@ -891,7 +891,7 @@ WHERE "createdAt" > now() - interval '1 hour';
 -- 4. SYNC LAG per mailbox — how stale is reply detection?
 --    This is the invariant "a reply stops the sequence" expressed as a number.
 SELECT id, email_hash, EXTRACT(EPOCH FROM (now() - "lastSyncedAt")) AS lag_sec
-FROM "Mailbox"
+FROM "EmailAccount"
 WHERE status = 'CONNECTED'
 ORDER BY lag_sec DESC NULLS FIRST
 LIMIT 20;
@@ -907,7 +907,7 @@ WHERE "createdAt" > now() - interval '24 hours';
 -- 6. DISCONNECTED MAILBOXES — every one is a campaign that has stopped.
 SELECT count(*) AS disconnected,
        count(*) FILTER (WHERE "disconnectedAt" > now() - interval '15 minutes') AS recent
-FROM "Mailbox"
+FROM "EmailAccount"
 WHERE status IN ('DISCONNECTED','AUTH_FAILED');
 ```
 
@@ -964,7 +964,7 @@ CONFIRM   platform: is the worker service running? crashed? OOM-killed?
           logs: last lines before silence — look for
             worker.shutdown{reason}  · worker.boot.schema_stale  · an unhandled throw
           SELECT * FROM "WorkerHeartbeat";              -- lastSeenAt, version, pid
-          SELECT status, count(*) FROM "Job" GROUP BY 1; -- LEASED rows are the orphans
+          SELECT state, count(*) FROM "Job" GROUP BY 1; -- RUNNING rows are the orphans
 
 ACT       1. Restart the worker service.
           2. If it boots then exits: read the exit reason.
@@ -973,12 +973,12 @@ ACT       1. Restart the worker service.
              · env validation failure → a secret is missing/mistyped; §2.2 printed
                the field name. Fix it in the platform store.
              · OOM → lower WORKER_CONCURRENCY, redeploy, then investigate the leak.
-          3. Orphaned LEASED jobs need no action: leases expire and the sweep
+          3. Orphaned RUNNING jobs need no action: leases expire and the sweep
              re-queues them. If you are impatient and certain the old process is
              dead:
                UPDATE "Job" SET status='PENDING', "leaseExpiresAt"=NULL,
                                 "leasedBy"=NULL
-                WHERE status='LEASED' AND "leaseExpiresAt" < now();
+                WHERE state='RUNNING' AND "leaseExpiresAt" < now();
              Never widen that WHERE clause. Resetting a job still held by a live
              worker is how you send an email twice.
           4. If the worker cannot be restarted at all, drain manually:
@@ -1003,10 +1003,10 @@ SYMPTOM   oldest_due_age_sec climbing past 15 min; heartbeat healthy.
 
 CONFIRM   Which job type is stuck?
             SELECT type, status, count(*), min("runAt") AS oldest
-              FROM "Job" WHERE status IN ('PENDING','LEASED') GROUP BY 1,2
+              FROM "Job" WHERE state IN ('PENDING','RUNNING','RETRYING') GROUP BY 1,2
               ORDER BY oldest;
           Are jobs failing and retrying in a loop?
-            SELECT type, attempts, count(*) FROM "Job"
+            SELECT type, attempt, count(*) FROM "Job"
              WHERE status='FAILED' GROUP BY 1,2 ORDER BY 2 DESC;
           Is one job type slow?  grep job.succeeded → durationMs percentiles.
           Are we rate-limited?   grep provider.rate_limited.
@@ -1037,7 +1037,7 @@ FOLLOW-UP If capacity was the cause, this is the signal to enforce pacing in the
 ```
 SYMPTOM   Several mailboxes → DISCONNECTED / AUTH_FAILED within minutes.
 
-CONFIRM   SELECT status, "disconnectReason", count(*) FROM "Mailbox"
+CONFIRM   SELECT status, "disconnectReason", count(*) FROM "EmailAccount"
             WHERE "disconnectedAt" > now() - interval '1 hour' GROUP BY 1,2;
           grep mailbox.token.refresh_failed → the HTTP status is the diagnosis:
             401 invalid_grant  → refresh tokens are dead (user revoked, password
@@ -1139,7 +1139,7 @@ CONFIRM   Concentrated or general?
              WHERE type='BOUNCED' AND "createdAt" > now()-interval '24 hours'
              GROUP BY 1;
           Recently imported list? A single bad CSV is the usual culprit.
-            Correlate bounced leads with lead."importBatchId".
+            Correlate bounced leads with lead."leadImportId".
 
 ACT       1. PAUSE the worst campaign(s) immediately. A pause is cheap;
              reputation is not.
@@ -1529,7 +1529,7 @@ table, so the test count is `states × events` and no pair is forgotten.
 |---|---|---|---|
 | `Campaign` | `DRAFT, ACTIVE, PAUSED, COMPLETED, ARCHIVED` | `DRAFT→ACTIVE`, `ACTIVE→PAUSED`, `PAUSED→ACTIVE` | `COMPLETED→ACTIVE`, `ARCHIVED→ACTIVE`, `DRAFT→PAUSED` |
 | `ScheduledEmail` | `PENDING, QUEUED, SENDING, SENT, FAILED, CANCELLED, SUPPRESSED` | `PENDING→QUEUED→SENDING→SENT` | **`SENT→QUEUED`** (the duplicate-send door), `SENT→SENDING`, `CANCELLED→SENDING`, `SENT→CANCELLED` |
-| `Job` | `PENDING, LEASED, SUCCEEDED, FAILED, DEAD` | `PENDING→LEASED→SUCCEEDED`, `LEASED→FAILED→PENDING` (retry), `FAILED→DEAD` (attempts exhausted) | `SUCCEEDED→LEASED`, `DEAD→PENDING` (only an explicit operator requeue, which is a different, audited transition) |
+| `Job` | `PENDING, RUNNING, RETRYING, SUCCEEDED, DEAD, CANCELLED` | `PENDING→RUNNING→SUCCEEDED`, `RUNNING→RETRYING→RUNNING` (retry), `RETRYING→DEAD` (attempts exhausted) | `SUCCEEDED→RUNNING`, `DEAD→PENDING` (only an explicit operator requeue, which is a different, audited transition) |
 | `Mailbox` | `CONNECTING, CONNECTED, AUTH_FAILED, DISCONNECTED, RATE_LIMITED` | `CONNECTED→AUTH_FAILED`, `AUTH_FAILED→CONNECTED` (re-consent) | `DISCONNECTED→CONNECTED` without a fresh credential |
 | `Lead` (per campaign) | `ACTIVE, REPLIED, UNSUBSCRIBED, BOUNCED, COMPLETED, SUPPRESSED` | `ACTIVE→REPLIED` | **`REPLIED→ACTIVE`** — once stopped, a sequence never resumes itself |
 | `Opportunity` | pipeline stages | forward and backward moves | move to a stage from another workspace's pipeline |
@@ -1776,14 +1776,14 @@ test('a job whose lease expired is re-leased exactly once', async () => { … })
 test('a crashed worker\'s job is recovered by the sweep', async () => {
   // Lease, then abandon without releasing (simulate SIGKILL by never renewing).
   // Advance leaseExpiresAt into the past, run the sweep, assert PENDING and
-  // attempts incremented — not attempts reset, or a poison job runs forever.
+  // attempt incremented — not attempt reset, or a poison job runs forever.
 });
 
 test('idempotency key prevents a duplicate enqueue', async () => {
   const key = 'send:se_123:attempt';
-  await enqueue({ type: 'SEND', idempotencyKey: key });
-  await enqueue({ type: 'SEND', idempotencyKey: key });
-  expect(await countJobs({ idempotencyKey: key })).toBe(1);
+  await enqueue({ type: 'SEND', dedupeKey: key });
+  await enqueue({ type: 'SEND', dedupeKey: key });
+  expect(await countJobs({ dedupeKey: key })).toBe(1);
 });
 
 test('the same ScheduledEmail cannot be sent twice under concurrent workers', async () => {
@@ -1805,7 +1805,7 @@ test('enqueue rolls back with its causing row', async () => {
 });
 
 test('backoff schedules the retry with jitter inside the expected band', async () => { … });
-test('attempts beyond maxAttempts move the job to DEAD, not PENDING', async () => { … });
+test('attempt beyond maxAttempts moves the job to DEAD, not PENDING', async () => { … });
 test('per-mailbox rate limiting holds across two workers', async () => {
   // Two workers, one mailbox, limit 5 → exactly 5 sends. If pacing lives only in
   // process memory this test fails, which is precisely why it exists (§1.2).
@@ -2437,17 +2437,33 @@ Called out so they stay out:
 
 ## 13. Open items for the lead engineer
 
-1. **Table and column names.** This document names `WorkerHeartbeat`,
-   `MailboxCredential.keyVersion`, `Job.{status,runAt,attempts,leaseExpiresAt,
-   leasedBy,idempotencyKey,enqueuedByRequestId}`, `Mailbox.{status,lastSyncedAt,
-   disconnectedAt,disconnectReason}`, `EmailEvent.{type,bounceKind,campaignId,
-   mailboxId,scheduledEmailId}`, and `Lead.importBatchId`. All of these need to
-   exist for §5.4 and §6 to work as written. Confirm with `02-data-model` and
-   `06-sending-engine` — if a name differs, the *check* is the contract and the
-   SQL should be corrected here.
-2. **`ENCRYPTION_KEY_VERSION` is not in `.env.example`.** §4.2 needs it. Add it
-   (default `1`) when the crypto module lands, or decide that version is derived
-   from key presence and simplify §4.2 accordingly.
+1. ~~**Table and column names.**~~ **RESOLVED by the lead — see
+   `DECISIONS.md` D4.** Every name in this document was checked against
+   `prisma/schema.prisma` and the stale ones corrected in place, because these
+   appeared inside *runnable* SQL (the §5.4 metrics and the §6 runbooks) rather
+   than in prose — a copy-pasteable query that errors is worse than no query.
+
+   | This doc said | The schema actually has |
+   |---|---|
+   | `Job.status` | `Job.state` |
+   | `JobState.LEASED` | `RUNNING` (leased); `RETRYING` is the backoff wait |
+   | `Job.attempts` | `Job.attempt` |
+   | `Job.idempotencyKey` | `Job.dedupeKey` |
+   | `"Mailbox"` | `"EmailAccount"` |
+   | `Lead.importBatchId` | `Lead.leadImportId` |
+
+   `WorkerHeartbeat` and `Job.enqueuedByRequestId` did not exist and were added
+   (`DECISIONS.md` D3), so §5.4's worker-liveness check and the tracing claim are
+   now real rather than aspirational.
+2. ~~**`ENCRYPTION_KEY_VERSION` is not in `.env.example`.**~~ **RESOLVED: no such
+   variable is needed.** `src/lib/crypto.ts` carries the key version *inside each
+   payload* (`v1.<iv>.<tag>.<ciphertext>`), so a record declares which key
+   encrypted it and `needsRotation()` reads it back. An env var would be a second,
+   drifting source of truth for a fact the data already states — and it would be
+   wrong during a rotation, when both key versions are legitimately in use.
+   Rotation therefore needs only `ENCRYPTION_KEY` plus the decrypt-only
+   `ENCRYPTION_KEY_PREVIOUS`, both already in `.env.example`. §4.2's rotation loop
+   should re-encrypt payloads where `needsRotation()` is true.
 3. **`.gitignore` needs `!.env.test`.** The current `.env.*` rule excludes it,
    and §2.1/CI depend on it being committed. One-line change, but it is not mine
    to make.
