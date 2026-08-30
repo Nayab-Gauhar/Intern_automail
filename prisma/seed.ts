@@ -2376,8 +2376,20 @@ async function seedOutreachHistory() {
   }
 
   // ── Mailbox rollups. 14 local days, so the deliverability chart has a real
-  //    series with quiet days in it rather than one spike. ──
+  //    series with quiet days in it rather than one spike.
+  //
+  //    Rebuilt rather than upserted. Every other table here is keyed by a stable
+  //    natural key, but a daily stat's key is a DATE — and the seed's dates slide
+  //    forward with the calendar. Upserting would leave yesterday's window behind
+  //    as an orphan row on the next day's run, so the chart would grow a longer
+  //    and longer tail the more often the seed ran. Deleting the workspace's rows
+  //    first is safe: MailboxDailyStat has no dependents and no append-only
+  //    trigger. ──
+  await db.mailboxDailyStat.deleteMany({ where: { workspaceId: WS } })
+
   const mailboxTotals = zero()
+  const dailyRows: Prisma.MailboxDailyStatCreateManyInput[] = []
+
   for (let d = -13; d <= 0; d += 1) {
     const key = localDate(at(d, 9 * 60)).toISOString()
     const c = daily.get(key) ?? zero()
@@ -2387,9 +2399,10 @@ async function seedOutreachHistory() {
     mailboxTotals.clicked += c.clicked
     mailboxTotals.opened += c.opened
 
-    const statData = {
+    dailyRows.push({
       workspaceId: WS,
       emailAccountId: MAILBOX,
+      localDate: new Date(key),
       sentCount: c.sent,
       warmupCount: 0,
       failedCount: 0,
@@ -2397,19 +2410,10 @@ async function seedOutreachHistory() {
       repliedCount: c.replied,
       openedCount: c.opened,
       clickedCount: c.clicked,
-    }
-
-    await db.mailboxDailyStat.upsert({
-      where: {
-        emailAccountId_localDate: {
-          emailAccountId: MAILBOX,
-          localDate: new Date(key),
-        },
-      },
-      create: { id: `sd_mds_${d + 13}`, localDate: new Date(key), ...statData },
-      update: statData,
     })
   }
+
+  await db.mailboxDailyStat.createMany({ data: dailyRows })
 
   await db.emailAccount.update({
     where: { id: MAILBOX },

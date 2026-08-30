@@ -614,6 +614,7 @@ model Workspace {
   experimentArms      ExperimentArm[]
   trackingLinks   TrackingLink[]
   dailySendStats  MailboxDailyStat[]
+  sendAttempts    SendAttempt[]
 
   @@index([deletedAt])
 }
@@ -798,6 +799,13 @@ model EmailAccount {
   repliedCount    Int      @default(0)
   complainedCount Int      @default(0)
   lastSentAt      DateTime? @db.Timestamptz(6)
+  /// Earliest instant this mailbox may send again. Claimed via compare-and-swap so
+  /// concurrent workers cannot both pass the pacing check. Distinct from
+  /// `throttledUntil`, which records a provider 429 rather than our own pacing.
+  /// Pacing cannot be derived from `lastSentAt`: that is written only AFTER a send
+  /// succeeds, so two workers starting together both read a stale value and both
+  /// send. See docs/architecture/DECISIONS.md D3.
+  nextSendAt      DateTime? @db.Timestamptz(6)
   lastSyncedAt    DateTime? @db.Timestamptz(6)
   lastErrorAt     DateTime? @db.Timestamptz(6)
   consecutiveFailures Int   @default(0)
@@ -821,6 +829,7 @@ model EmailAccount {
   events           EmailEvent[]
   campaignMailboxes CampaignMailbox[]
   dailyStats       MailboxDailyStat[]
+  sendAttempts      SendAttempt[]
   warmupMemberships WarmupPoolMember[]
   webhookEvents    WebhookEvent[]
 
@@ -830,6 +839,8 @@ model EmailAccount {
   @@index([domainId])
   /// Serves the scheduler's mailbox-selection scan.
   @@index([status, throttledUntil])
+  /// Serves the sender's "which mailboxes may send now" scan.
+  @@index([status, nextSendAt])
   @@index([providerAccountId])
 }
 
@@ -941,6 +952,14 @@ model MailboxDailyStat {
   /// wall-clock length of the day but not which date a send counts against,
   /// which is the behaviour operators expect.
   localDate DateTime @db.Date
+
+  /// Reservation counter for the daily cap, incremented BEFORE the provider call.
+  /// `sentCount` alone cannot enforce a cap: two workers both read "under cap",
+  /// both send, and the cap is exceeded. Reserving first closes that window while
+  /// leaving `sentCount` a truthful record of what actually went out, which is what
+  /// analytics reads. The invariant `reservedCount >= sentCount` is a CHECK
+  /// constraint in migration SQL. See docs/architecture/DECISIONS.md D3.
+  reservedCount Int @default(0)
 
   sentCount    Int @default(0)
   warmupCount  Int @default(0)
@@ -1772,6 +1791,7 @@ model ScheduledEmail {
   messages EmailMessage[]
   events   EmailEvent[]
   jobs     Job[]
+  attempts SendAttempt[]
 
   /// ── THE double-send guarantee ──
   /// One row per (enrollment, step). A retried scheduler tick, a duplicated job,
@@ -2588,6 +2608,12 @@ model Job {
   /// Duration of the last attempt. Cheap p95 observability without a metrics store.
   durationMs  Int?
 
+  /// Correlation id of the request or parent job that enqueued this one. Makes
+  /// "why has this lead not received step 3?" answerable by joining a job back to
+  /// the request that created it. Nullable: recurring jobs have no originating
+  /// request. See docs/architecture/DECISIONS.md D3.
+  enqueuedByRequestId String?
+
   createdAt DateTime @default(now()) @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @db.Timestamptz(6)
 
@@ -2631,4 +2657,106 @@ model RateLimit {
 
   /// Makes `DELETE FROM "RateLimit" WHERE "expiresAt" < now()` cheap.
   @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WORKER OBSERVABILITY AND SEND FORENSICS
+// See docs/architecture/06-jobs-and-sending-engine.md §2.2-§2.3 and DECISIONS D3.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row per worker process; its liveness IS this row. The worker exposes no
+/// HTTP server, so /api/health answers "is a worker alive" by reading lastSeenAt
+/// here. Without this table that check can only be a stub.
+///
+/// Not tenant-owned: a worker serves every workspace.
+model WorkerHeartbeat {
+  /// "<hostname>:<pid>:<random>" — the same workerId written to Job.lockedBy, so a
+  /// stuck job can be traced to the process holding it.
+  id       String @id
+  hostname String
+  pid      Int
+  /// Build SHA, so a bad deploy is identifiable from the queue alone.
+  version  String?
+
+  /// Jobs currently leased by this worker. Cheap queue-depth attribution.
+  leasedCount Int @default(0)
+
+  startedAt  DateTime  @db.Timestamptz(6)
+  lastSeenAt DateTime  @db.Timestamptz(6)
+  /// Set on graceful shutdown. A row with a stale lastSeenAt and no stoppedAt
+  /// died hard, which is exactly the case lease reclamation exists for.
+  stoppedAt  DateTime? @db.Timestamptz(6)
+
+  /// Drives the liveness query and the stale-worker sweep.
+  @@index([lastSeenAt])
+}
+
+/// One row per attempt to hand a message to a provider — the forensics behind the
+/// crash-after-accept problem.
+///
+/// The hard case: a worker calls the provider, the provider accepts, and the
+/// worker dies before committing. On restart we must distinguish "accepted" from
+/// "never sent", or we either double-send or silently drop. That decision needs a
+/// record written BEFORE the provider call, which is what this is.
+model SendAttempt {
+  id String @id @default(cuid())
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  scheduledEmailId String
+  scheduledEmail   ScheduledEmail @relation(fields: [scheduledEmailId], references: [id], onDelete: Cascade)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  /// 1-based, matching Job.attempt.
+  attempt Int
+
+  /// Worker that made this attempt (WorkerHeartbeat.id).
+  workerId String?
+
+  /// Deterministic token derived from scheduledEmailId, sent as a provider header
+  /// so reconciliation can search the mailbox for a message we may have sent.
+  /// Reproducible rather than random, which is the whole point.
+  sendToken String
+
+  state SendAttemptState @default(STARTED)
+
+  /// Set once the provider returns an id. Its presence is the proof of acceptance
+  /// that reconciliation looks for.
+  providerMessageId String?
+  providerThreadId  String?
+
+  /// Provider error detail on failure. Never contains the message body.
+  errorCode    String?
+  errorMessage String?
+  retryable    Boolean?
+
+  startedAt   DateTime  @default(now()) @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+  durationMs  Int?
+
+  /// One attempt row per (send, attempt number) — a retried write cannot fork the
+  /// forensic record.
+  @@unique([scheduledEmailId, attempt])
+  /// Reconciliation scan: attempts left STARTED by a dead worker.
+  @@index([state, startedAt])
+  @@index([workspaceId, startedAt(sort: Desc)])
+  @@index([emailAccountId, startedAt(sort: Desc)])
+  @@index([sendToken])
+}
+
+enum SendAttemptState {
+  /// Written before the provider call. Seeing this after a restart means we do not
+  /// know whether the message went out — reconciliation must decide.
+  STARTED
+  /// Provider returned an id.
+  ACCEPTED
+  /// Provider rejected it. `retryable` says whether another attempt is allowed.
+  FAILED
+  /// Reconciliation proved the message was delivered by a previous attempt.
+  RECONCILED_SENT
+  /// Reconciliation proved it never went out, so a resend is safe.
+  RECONCILED_NOT_SENT
 }
