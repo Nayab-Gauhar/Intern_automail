@@ -18,8 +18,11 @@ const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.ur
   scripts: Record<string, string>
 }
 
-/** Scripts that boot the app and therefore reach the password primitives. */
-const MUST_USE_BUN = ['dev', 'start'] as const
+/**
+ * Scripts that boot the app and therefore reach the password primitives.
+ * Not `as const`: test.each rejects a readonly tuple.
+ */
+const MUST_USE_BUN: string[] = ['dev', 'start']
 
 describe('scripts that serve the app run under Bun', () => {
   test.each(MUST_USE_BUN)('%s uses `bun --bun`', (name) => {
